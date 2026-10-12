@@ -67,4 +67,4 @@ class TagSanitizer:
             
             clean_artists.append(final_artist)
             
-        return clean_artists
+        return list(dict.fromkeys(clean_artists))

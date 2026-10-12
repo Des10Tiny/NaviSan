@@ -6,8 +6,8 @@ import websockets
 import json
 import webbrowser
 from mutagen.flac import FLAC, Picture
-
 from sanitizer import TagSanitizer
+import re
 
 class FLACSurgeon:
     def __init__(self, sanitizer):
@@ -188,9 +188,36 @@ class FLACSurgeon:
         for key, val in saved_tags.items():
             audio[key] = val
 
-        # 3. ОБРАБОТКА ИМЕН АРТИСТОВ
+        # 3. ОБРАБОТКА ИМЕН АРТИСТОВ И ОЧИСТКА НАЗВАНИЯ ТРЕКА
+        extracted_feats = ""
+        
+        # Парсим Title на наличие фитов и мусора
+        if 'title' in audio:
+            title_str = audio['title'][0]
+            
+            # Ищем фиты в скобках или в конце строки
+            feat_pattern = re.compile(r'(?i)(?:[\[\(](?:feat\.?|ft\.?)\s+([^\]\)]+)[\]\)]|\s+(?:feat\.?|ft\.?)\s+(.+)$)')
+            feat_match = feat_pattern.search(title_str)
+            
+            if feat_match:
+                # Берем первую или вторую группу (смотря как нашлось)
+                extracted_feats = feat_match.group(1) or feat_match.group(2)
+                # Вырезаем фит из названия трека
+                title_str = feat_pattern.sub('', title_str)
+                
+            # Ищем и вырезаем (prod. by ...) и [prod ...]
+            prod_pattern = re.compile(r'(?i)[\[\(]prod\..*?[\]\)]')
+            title_str = prod_pattern.sub('', title_str)
+            
+            # Убираем двойные пробелы, если остались после вырезания
+            audio['title'] = [re.sub(r'\s+', ' ', title_str).strip()]
+
+        # Склеиваем артистов из тега + артистов, которых мы спасли из названия
         if 'artist' in audio:
             raw_artist_string = " & ".join(audio['artist']) 
+            if extracted_feats:
+                raw_artist_string += f" & {extracted_feats}" # Добавляем фиты в котел
+                
             audio['artist'] = self.sanitizer.process_artists(raw_artist_string)
 
         if 'albumartist' in audio:
