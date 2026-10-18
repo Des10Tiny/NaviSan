@@ -1,6 +1,60 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environments
 venv/
-test_music/
+.venv/
+env/
+ENV/
+
+# Configuration & secrets
+.env
+*.env
+!*.env.example
+
+# Local databases and runtime data
+navidrome.db
+*.db
+*.sqlite
+*.sqlite3
 aliases.json
-__pycache__
-main.py
+!aliases.example.json
 unknown_artists.txt
+*.log
+
+# Audio files, covers, test data
+test_music/
+inbox/
+staging/
+library/
+*.flac
+*.lrc
+cover.jpg
+
+# Docs
+docs/
+
+# Old obsolete test entry point
+main.py
+
+# AI assistants, IDEs, and OS artifacts
+CLAUDE.md
+CONTEXT.md
+IDEA.md
+.scratch/
+.claude/
+.gemini/
+.cursor/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
