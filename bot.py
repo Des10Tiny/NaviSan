@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from enum import Enum, auto
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -29,6 +30,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
+from telegram.error import BadRequest
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -50,6 +52,12 @@ from pipeline import (
     count_flacs,
     move_to_library,
     update_album_cover,
+    get_album_artists_info,
+    get_album_artist_suggestions,
+    add_track_artist,
+    remove_track_artist,
+    update_album_artist,
+    upgrade_library,
 )
 from watcher import watch_inbox
 
@@ -61,10 +69,25 @@ logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 OWNER_ID: int = int(os.environ["NAVISAN_OWNER_ID"])
+
+
+def delete_later(bot, chat_id: int, message_id: int, delay: float = 4.0) -> None:
+    """Удаляет сообщение через delay секунд в фоне, чтобы не засорять историю чата."""
+    async def _worker():
+        await asyncio.sleep(delay)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
+
+    asyncio.create_task(_worker())
+
 INBOX: Path = Path(os.environ.get("NAVISAN_INBOX", "/inbox"))
 STAGING: Path = Path(os.environ.get("NAVISAN_STAGING", "/staging"))
 LIBRARY: Path = Path(os.environ.get("NAVISAN_LIBRARY", "/library"))
@@ -285,13 +308,18 @@ async def on_cover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
     session = _sessions.get(OWNER_ID)
     if not session or session.state != SessionState.COVER_PENDING:
-        await ctx.bot.send_message(chat_id=OWNER_ID, text="⚠️ Сессия устарела. Запусти поиск заново.")
+        await query.answer("⚠️ Сессия устарела. Запусти поиск заново.", show_alert=True)
         return
 
     _, action, *args = query.data.split(":")
 
     # Удаляем сообщение со слайдшоу сразу при клике, чтобы чат оставался чистым
-    if session.picker_message_id:
+    if query.message:
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+    if session.picker_message_id and (not query.message or query.message.message_id != session.picker_message_id):
         try:
             await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=session.picker_message_id)
         except Exception:
@@ -305,25 +333,21 @@ async def on_cover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             session.picker_message_id = msg_id
         except Exception as e:
             log.error("Ошибка при показе следующей страницы обложек: %s", e)
-            await ctx.bot.send_message(
-                chat_id=OWNER_ID,
-                text=f"⚠️ Ошибка при переключении вариантов: `{e}`",
-                parse_mode="Markdown",
-            )
+            await query.answer(f"⚠️ Ошибка: {e}", show_alert=True)
         return
 
     # 2. Отмена
     if action == "cancel":
         session.state = SessionState.DONE
         msg = "Обработка отменена." if not session.is_recover else "Смена обложки отменена."
-        await ctx.bot.send_message(chat_id=OWNER_ID, text=f"❌ {msg}")
+        await query.answer(f"❌ {msg}")
         return
 
     # 3. Пропуск обложки
     if action == "skip":
         if session.is_recover:
             session.state = SessionState.DONE
-            await ctx.bot.send_message(chat_id=OWNER_ID, text="Обложка оставлена без изменений.")
+            await query.answer("Обложка оставлена без изменений.")
             return
 
         session.chosen_cover = None
@@ -336,7 +360,7 @@ async def on_cover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if action == "pick":
         idx = int(args[0])
         if not (0 <= idx < len(session.candidates)):
-            await ctx.bot.send_message(chat_id=OWNER_ID, text="❌ Ошибка: неверный номер обложки.")
+            await query.answer("❌ Неверный номер обложки.", show_alert=True)
             return
 
         chosen = session.candidates[idx]
@@ -403,7 +427,13 @@ async def _execute_pipeline_and_report(status_msg, ctx: ContextTypes.DEFAULT_TYP
     final_text = f"✅ *Альбом добавлен в библиотеку!*\n\n{report}"
 
     keyboard = [
-        [InlineKeyboardButton("📝 Настроить тексты", callback_data=f"lyrics:album:{library_folder.name}")],
+        [
+            InlineKeyboardButton("📝 Настроить тексты", callback_data=f"lyrics:album:{library_folder.name}"),
+            InlineKeyboardButton("👤 Настроить артистов", callback_data=f"artist:album:{library_folder.name}"),
+        ],
+        [
+            InlineKeyboardButton("❌ Закрыть", callback_data="report:close"),
+        ],
     ]
 
     try:
@@ -421,6 +451,20 @@ async def _execute_pipeline_and_report(status_msg, ctx: ContextTypes.DEFAULT_TYP
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
+
+
+async def on_report_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик закрытия финального отчёта."""
+    query = update.callback_query
+    await query.answer()
+    if update.effective_user.id != OWNER_ID:
+        return
+    if query.data == "report:close":
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+
 
 
 def _run_full_pipeline(session: AlbumSession) -> tuple[list[str], Path]:
@@ -466,9 +510,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Когда slskd докачает новый релиз — я пришлю нативный слайдшоу обложек "
         "(свайпай прямо в Telegram!) и добавлю альбом без лишнего мусора в чат.\n\n"
         "*Команды:*\n"
+        "• `/upgrade` — пакетная идеализация всей библиотеки разом\n"
         "• `/scan` — сканировать Inbox и выбрать релиз вручную\n"
         "• `/cover [поиск]` — сменить обложку для альбома в Library\n"
         "• `/lyrics [поиск]` — превью и настройка текстов песен (.lrc)\n"
+        "• `/artist [поиск]` — проверить и настроить артистов релиза\n"
         "• `/process <папка>` — принудительно обработать релиз из Inbox\n"
         "• `/status` — статус текущей сессии\n"
         "• `/cancel` — отменить текущий ввод текста",
@@ -504,7 +550,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Принудительное сканирование Inbox — для папок, которые уже лежали в папке."""
     if not INBOX.exists():
-        await update.message.reply_text("❌ Папка Inbox не найдена.", parse_mode="Markdown")
+        msg = await update.message.reply_text("❌ Папка Inbox не найдена.", parse_mode="Markdown")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
         return
 
     folders = sorted([
@@ -513,7 +561,9 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ])
 
     if not folders:
-        await update.message.reply_text("📭 Inbox пуст — нет папок с FLAC-файлами.")
+        msg = await update.message.reply_text("📭 Inbox пуст — нет папок с FLAC-файлами.")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
         return
 
     lines = [f"📥 *Папки в Inbox ({len(folders)}):*\n"]
@@ -526,7 +576,9 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"scan:{i}"))
 
     ctx.bot_data["scan_folders"] = folders
+    ctx.bot_data["scan_cmd_msg_id"] = update.message.message_id
     keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
+    keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="scan:close")])
 
     await update.message.reply_text(
         "\n".join(lines),
@@ -543,19 +595,41 @@ async def on_scan_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     if update.effective_user.id != OWNER_ID:
         return
 
+    # Закрытие меню выбора папки
+    if query.data == "scan:close":
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        cmd_id = ctx.bot_data.pop("scan_cmd_msg_id", None)
+        if cmd_id:
+            try:
+                await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=cmd_id)
+            except Exception:
+                pass
+        return
+
     folders = ctx.bot_data.get("scan_folders", [])
     _, payload = query.data.split(":", 1)
     idx = int(payload)
 
     if idx >= len(folders):
-        await query.edit_message_text("❌ Некорректный номер.")
+        await query.answer("❌ Некорректный номер папки", show_alert=True)
         return
 
     folder = folders[idx]
+
+    # Удаляем меню scan и исходную команду /scan пользователя
     try:
         await query.delete_message()
     except Exception:
         pass
+    cmd_id = ctx.bot_data.pop("scan_cmd_msg_id", None)
+    if cmd_id:
+        try:
+            await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=cmd_id)
+        except Exception:
+            pass
 
     await _on_new_release(folder, ctx.application)
 
@@ -564,7 +638,9 @@ async def on_scan_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_cover(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Смена обложки для уже существующего альбома в Library."""
     if not LIBRARY.exists():
-        await update.message.reply_text("❌ Папка Library не найдена.", parse_mode="Markdown")
+        msg = await update.message.reply_text("❌ Папка Library не найдена.", parse_mode="Markdown")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
         return
 
     query_str = " ".join(ctx.args).strip() if ctx.args else ""
@@ -575,7 +651,9 @@ async def cmd_cover(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ])
 
     if not all_albums:
-        await update.message.reply_text("📭 В Library пока нет альбомов с FLAC-файлами.")
+        msg = await update.message.reply_text("📭 В Library пока нет альбомов с FLAC-файлами.")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
         return
 
     if query_str:
@@ -584,11 +662,17 @@ async def cmd_cover(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         matches = all_albums[-10:]
 
     if not matches:
-        await update.message.reply_text(f"❌ Ничего не найдено по запросу: `{query_str}`", parse_mode="Markdown")
+        msg = await update.message.reply_text(f"❌ Ничего не найдено по запросу: `{query_str}`", parse_mode="Markdown")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
         return
 
     # Если ровно одно совпадение — сразу открываем слайдшоу!
     if len(matches) == 1 and query_str:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
         await _on_new_release(matches[0], ctx.application, is_recover=True)
         return
 
@@ -602,7 +686,9 @@ async def cmd_cover(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"recover:{i}"))
 
     ctx.bot_data["recover_folders"] = matches
+    ctx.bot_data["cover_cmd_msg_id"] = update.message.message_id
     keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
+    keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="recover:close")])
 
     await update.message.reply_text(
         "\n".join(lines),
@@ -619,12 +705,26 @@ async def on_recover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if update.effective_user.id != OWNER_ID:
         return
 
+    # Закрытие меню
+    if query.data == "recover:close":
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        cmd_id = ctx.bot_data.pop("cover_cmd_msg_id", None)
+        if cmd_id:
+            try:
+                await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=cmd_id)
+            except Exception:
+                pass
+        return
+
     folders = ctx.bot_data.get("recover_folders", [])
     _, payload = query.data.split(":", 1)
     idx = int(payload)
 
     if idx >= len(folders):
-        await query.edit_message_text("❌ Некорректный номер.")
+        await query.answer("❌ Некорректный номер альбома", show_alert=True)
         return
 
     folder = folders[idx]
@@ -632,6 +732,12 @@ async def on_recover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         await query.delete_message()
     except Exception:
         pass
+    cmd_id = ctx.bot_data.pop("cover_cmd_msg_id", None)
+    if cmd_id:
+        try:
+            await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=cmd_id)
+        except Exception:
+            pass
 
     await _on_new_release(folder, ctx.application, is_recover=True)
 
@@ -640,10 +746,12 @@ async def on_recover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 async def cmd_process(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Ручной запуск обработки для указанной папки из Inbox."""
     if not ctx.args:
-        await update.message.reply_text(
+        msg = await update.message.reply_text(
             "Укажи имя папки в Inbox:\n`/process Имя Папки`\nИли выбери папку через `/scan`",
             parse_mode="Markdown",
         )
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=5.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=5.0)
         return
 
     target_str = " ".join(ctx.args).strip()
@@ -656,10 +764,164 @@ async def cmd_process(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             folder = inbox_candidate
 
     if not folder.exists() or not folder.is_dir():
-        await update.message.reply_text(f"❌ Папка не найдена: `{Path(target_str).name}`", parse_mode="Markdown")
+        msg = await update.message.reply_text(f"❌ Папка не найдена: `{Path(target_str).name}`", parse_mode="Markdown")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=5.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=5.0)
         return
 
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
     await _on_new_release(folder, ctx.application)
+
+
+@_owner_only
+async def cmd_upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /upgrade — пакетная идеализация всей библиотеки разом."""
+    if not LIBRARY.exists():
+        msg = await update.message.reply_text("❌ Папка Library не найдена.", parse_mode="Markdown")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
+        return
+
+    albums = sorted([
+        d for d in LIBRARY.iterdir()
+        if d.is_dir() and any(f.suffix.lower() == ".flac" for f in d.rglob("*.flac") if f.is_file())
+    ])
+
+    if not albums:
+        msg = await update.message.reply_text("📭 В Library пока нет альбомов с FLAC-файлами.")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
+        return
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    text = (
+        "🚀 *Пакетная идеализация библиотеки*\n\n"
+        f"📁 Каталог: `{LIBRARY.name}`\n"
+        f"💿 Альбомов для обработки: *{len(albums)}*\n\n"
+        "*Что будет выполнено автоматически:*\n"
+        "• Очистка от ID3-мусора и нормализация тегов\n"
+        "• Проверка обложек: сохранение текущих или поиск новых Hi-Res\n"
+        "• Загрузка недостающих караоке-текстов (.lrc) с LRCLIB и Genius\n"
+        "• Приведение треков к формату '01. Title.flac' и папок к 'Artist - Album'\n\n"
+        "_Существующие качественные обложки не перезаписываются._"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("▶️ Начать идеализацию", callback_data="upgrade:start")],
+        [InlineKeyboardButton("❌ Закрыть", callback_data="upgrade:close")],
+    ]
+
+    await ctx.bot.send_message(
+        chat_id=OWNER_ID,
+        text=text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик интерактивной идеализации библиотеки."""
+    query = update.callback_query
+    await query.answer()
+
+    if update.effective_user.id != OWNER_ID:
+        return
+
+    action = query.data.split(":")[1]
+
+    if action == "close":
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        return
+
+    if action == "stop":
+        ctx.bot_data["upgrade_cancelled"] = True
+        await query.answer("Останавливаю процесс…", show_alert=True)
+        return
+
+    if action == "start":
+        if ctx.bot_data.get("upgrade_running"):
+            await query.answer("Идеализация уже выполняется!", show_alert=True)
+            return
+
+        ctx.bot_data["upgrade_running"] = True
+        ctx.bot_data["upgrade_cancelled"] = False
+
+        last_edit_time = 0.0
+        loop = asyncio.get_running_loop()
+
+        def _on_progress(cur: int, tot: int, alb_name: str, res: dict):
+            nonlocal last_edit_time
+            now = time.time()
+            if now - last_edit_time > 2.0 or cur == tot:
+                last_edit_time = now
+                pct = int((cur / tot) * 100)
+                txt = (
+                    f"⏳ *Идеализация библиотеки: {cur}/{tot} ({pct}%)*\n\n"
+                    f"💿 Текущий: *{alb_name}*\n"
+                    f"📝 Тексты: +{res.get('lyrics_added', 0)} | 🖼️ Обложка: {'+' if res.get('cover_added') else 'OK'}\n\n"
+                    f"_Пожалуйста, подожди завершения…_"
+                )
+                kb = [[InlineKeyboardButton("⏹️ Остановить", callback_data="upgrade:stop")]]
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        _safe_edit_message(query, txt, reply_markup=InlineKeyboardMarkup(kb)),
+                        loop,
+                    )
+                except Exception:
+                    pass
+
+        def _is_cancelled() -> bool:
+            return bool(ctx.bot_data.get("upgrade_cancelled", False))
+
+        init_text = "⏳ *Идеализация библиотеки запущена…*\n\nАнализирую релизы…"
+        init_kb = [[InlineKeyboardButton("⏹️ Остановить", callback_data="upgrade:stop")]]
+        await _safe_edit_message(query, init_text, reply_markup=InlineKeyboardMarkup(init_kb))
+
+        try:
+            summary = await loop.run_in_executor(
+                None,
+                lambda: upgrade_library(
+                    LIBRARY,
+                    aliases_path=ALIASES_PATH,
+                    db_path=DB_PATH,
+                    progress_callback=_on_progress,
+                    cancel_flag=_is_cancelled,
+                ),
+            )
+        finally:
+            ctx.bot_data["upgrade_running"] = False
+
+        stopped_str = " (прервано пользователем)" if ctx.bot_data.get("upgrade_cancelled") else ""
+        final_text = (
+            f"✅ *Идеализация библиотеки завершена{stopped_str}!* 🎉\n\n"
+            f"💿 Обработано альбомов: *{summary['processed']}/{summary['total']}*\n"
+            f"🖼️ Добавлено обложек: *{summary['covers_added']}*\n"
+            f"📝 Загружено текстов (.lrc): *{summary['lyrics_added']}*"
+        )
+        final_kb = [[InlineKeyboardButton("❌ Закрыть", callback_data="upgrade:close")]]
+        await _safe_edit_message(query, final_text, reply_markup=InlineKeyboardMarkup(final_kb))
+
+
+async def _safe_edit_message(query, text: str, reply_markup=None, parse_mode="Markdown") -> None:
+    """Редактирует сообщение, безопасно игнорируя 'Message is not modified'."""
+    try:
+        await query.edit_message_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            pass
+        else:
+            raise
 
 
 # ── Настройка текстов песен (Lyrics UI) ───────────────────────────────────────
@@ -751,7 +1013,9 @@ def _render_track_lyrics_card(track_path: Path, track_idx: int) -> tuple[str, li
 async def cmd_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /lyrics [запрос] — просмотр и настройка текстов песен в Library."""
     if not LIBRARY.exists():
-        await update.message.reply_text("❌ Папка Library не найдена.", parse_mode="Markdown")
+        msg = await update.message.reply_text("❌ Папка Library не найдена.", parse_mode="Markdown")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
         return
 
     query_str = " ".join(ctx.args).strip() if ctx.args else ""
@@ -762,7 +1026,9 @@ async def cmd_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ])
 
     if not all_albums:
-        await update.message.reply_text("📭 В Library пока нет альбомов с FLAC-файлами.")
+        msg = await update.message.reply_text("📭 В Library пока нет альбомов с FLAC-файлами.")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
         return
 
     if query_str:
@@ -771,11 +1037,17 @@ async def cmd_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         matches = all_albums[-10:]
 
     if not matches:
-        await update.message.reply_text(f"❌ Ничего не найдено по запросу: `{query_str}`", parse_mode="Markdown")
+        msg = await update.message.reply_text(f"❌ Ничего не найдено по запросу: `{query_str}`", parse_mode="Markdown")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
         return
 
     # Если ровно один альбом совпал — открываем его список треков!
     if len(matches) == 1:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
         album_dir = matches[0]
         tracks = sorted(album_dir.rglob("*.flac"))
         ctx.bot_data["lyrics_tracks"] = tracks
@@ -794,6 +1066,7 @@ async def cmd_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"lyrics:alb:{i}"))
 
     ctx.bot_data["lyrics_albums"] = matches
+    ctx.bot_data["lyrics_cmd_msg_id"] = update.message.message_id
     keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
     keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close")])
 
@@ -804,33 +1077,539 @@ async def cmd_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-@_owner_only
-async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Сбрасывает ожидание ручного ввода текста."""
-    waiting_key = f"lyrics_waiting_{OWNER_ID}"
-    if waiting_key in ctx.bot_data:
-        del ctx.bot_data[waiting_key]
-        await update.message.reply_text("Ввод текста отменён.")
+# ── Настройка артистов (Artist UI) ───────────────────────────────────────────
+
+def _render_album_artists_view(album_dir: Path) -> tuple[str, list[list[InlineKeyboardButton]]]:
+    """Формирует обзор артистов альбома и кнопки выбора треков."""
+    info = get_album_artists_info(album_dir)
+    album_display = info["album"] or album_dir.name
+
+    lines = [
+        "👤 *Артисты релиза:*",
+        f"💿 *{album_display}*",
+        f"📂 Папка: `{album_dir.name}`",
+        f"🏷️ *ALBUMARTIST:* `{info['album_artist']}`\n",
+        "🎵 *Треки и артисты:*",
+    ]
+    buttons = []
+    for i, t in enumerate(info["tracks"]):
+        num = t["track_num"] or str(i + 1)
+        artists_str = ", ".join(t["artists"]) if t["artists"] else "—"
+        lines.append(f"{i + 1}. `{num}. {t['title']}`\n   👤 _{artists_str}_")
+        buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"artist:tr:{i}"))
+
+    lines.append("\n_Нажми номер трека, чтобы настроить его артистов:_")
+
+    keyboard = [
+        [InlineKeyboardButton("🏷️ Изменить ALBUMARTIST", callback_data="artist:editaa")],
+    ]
+    for row_start in range(0, len(buttons), 5):
+        keyboard.append(buttons[row_start : row_start + 5])
+
+    keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="artist:close")])
+    return "\n".join(lines), keyboard
+
+
+def _render_album_artist_edit_card(album_dir: Path, suggestions: list[str]) -> tuple[str, list[list[InlineKeyboardButton]]]:
+    """Формирует карточку редактирования ALBUMARTIST с динамическими подсказками из треков."""
+    info = get_album_artists_info(album_dir)
+    album_display = info["album"] or album_dir.name
+    current_aa = info["album_artist"]
+
+    example_hint = f" (например, `{suggestions[0]}`)" if suggestions else ""
+    lines = [
+        "🏷️ *Настройка ALBUMARTIST релиза:*",
+        f"💿 *{album_display}*",
+        f"📂 Папка: `{album_dir.name}`",
+        f"🏷️ Текущий ALBUMARTIST: `{current_aa}`\n",
+        "Выбери готовый вариант кнопкой ниже или нажми *«✍️ Ввести свой вариант»* (также можно просто отправить сообщение в чат)"
+        f"{example_hint}.\n",
+        "Для отмены команды отправь /cancel.",
+    ]
+
+    keyboard = []
+    for idx, s in enumerate(suggestions):
+        keyboard.append([
+            InlineKeyboardButton(f"👤 {s}", callback_data=f"artist:setaa:{idx}")
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton("✍️ Ввести свой вариант", callback_data="artist:customaa")
+    ])
+    keyboard.append([
+        InlineKeyboardButton("🗑️ Очистить ALBUMARTIST (удалить тег)", callback_data="artist:setaa:clear")
+    ])
+    keyboard.append([
+        InlineKeyboardButton("⬅️ Назад к альбому", callback_data="artist:alb_back"),
+        InlineKeyboardButton("❌ Закрыть", callback_data="artist:close"),
+    ])
+
+    return "\n".join(lines), keyboard
+
+
+def _render_album_artist_custom_prompt(album_dir: Path) -> tuple[str, list[list[InlineKeyboardButton]]]:
+    """Формирует карточку ожидания ручного ввода ALBUMARTIST."""
+    info = get_album_artists_info(album_dir)
+    album_display = info["album"] or album_dir.name
+    current_aa = info["album_artist"]
+    suggestions = get_album_artist_suggestions(album_dir)
+    example_hint = f" (например: `{suggestions[0]}`)" if suggestions else ""
+
+    lines = [
+        "✍️ *Ввод ALBUMARTIST вручную:*",
+        f"💿 *{album_display}*",
+        f"📂 Папка: `{album_dir.name}`",
+        f"🏷️ Текущий ALBUMARTIST: `{current_aa}`\n",
+        f"Отправь новое значение ALBUMARTIST ответным сообщением в чат{example_hint}.\n",
+        "_Для отмены нажми кнопку ниже или отправь /cancel._",
+    ]
+    keyboard = [
+        [InlineKeyboardButton("⬅️ Назад к вариантам", callback_data="artist:editaa")],
+        [InlineKeyboardButton("❌ Закрыть", callback_data="artist:close")],
+    ]
+    return "\n".join(lines), keyboard
+
+
+def _render_track_artist_card(track_path: Path, track_idx: int) -> tuple[str, list[list[InlineKeyboardButton]], list[str]]:
+    """Формирует карточку трека со списком артистов и кнопками управления."""
+    try:
+        audio = FLAC(str(track_path))
+        track_num = audio.get("tracknumber", [""])[0].split("/")[0]
+        title = audio.get("title", [track_path.stem])[0]
+        artists = audio.get("artist", [])
+    except Exception:
+        track_num = ""
+        title = track_path.stem
+        artists = []
+
+    display_title = f"{track_num}. {title}" if track_num else title
+    lines = [
+        f"🎵 *Трек:* `{display_title}`",
+        f"📂 `{track_path.name}`\n",
+        "👤 *Текущие артисты в теге ARTIST:*",
+    ]
+
+    if artists:
+        for i, art in enumerate(artists, 1):
+            lines.append(f"• {i}. `{art}`")
     else:
-        await update.message.reply_text("Нет активных действий для отмены.")
+        lines.append("❌ _Артисты не указаны_")
+
+    keyboard = []
+    for i, art in enumerate(artists):
+        keyboard.append([
+            InlineKeyboardButton(f"❌ Удалить: {art}", callback_data=f"artist:del:{track_idx}:{i}")
+        ])
+
+    # Динамически находим других артистов релиза, которых ещё нет в тегах этого трека
+    other_artists: list[str] = []
+    try:
+        info = get_album_artists_info(track_path.parent)
+        for t in info.get("tracks", []):
+            for a in t.get("artists", []):
+                if a not in artists and a not in other_artists:
+                    other_artists.append(a)
+        if info.get("album_artist") and info["album_artist"] != "—":
+            for a in info["album_artist"].split(","):
+                a = a.strip()
+                if a and a not in artists and a not in other_artists:
+                    other_artists.append(a)
+    except Exception:
+        pass
+
+    for i, art in enumerate(other_artists[:3]):
+        keyboard.append([
+            InlineKeyboardButton(f"➕ Добавить: {art}", callback_data=f"artist:qadd:{track_idx}:{i}")
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton("✏️ Ввести другое имя", callback_data=f"artist:add:{track_idx}")
+    ])
+    keyboard.append([
+        InlineKeyboardButton("⬅️ К альбому", callback_data="artist:alb_back"),
+        InlineKeyboardButton("❌ Закрыть", callback_data="artist:close"),
+    ])
+
+    return "\n".join(lines), keyboard, other_artists
 
 
-async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик кнопок управления текстами."""
+@_owner_only
+async def cmd_artist(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /artist [запрос] — просмотр и редактирование артистов релиза в Library."""
+    if not LIBRARY.exists():
+        msg = await update.message.reply_text("❌ Папка Library не найдена.", parse_mode="Markdown")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
+        return
+
+    query_str = " ".join(ctx.args).strip() if ctx.args else ""
+
+    all_albums = sorted([
+        d for d in LIBRARY.iterdir()
+        if d.is_dir() and any(f.suffix.lower() == ".flac" for f in d.iterdir() if f.is_file())
+    ])
+
+    if not all_albums:
+        msg = await update.message.reply_text("📭 В Library пока нет альбомов с FLAC-файлами.")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
+        return
+
+    if query_str:
+        matches = [d for d in all_albums if query_str.lower() in d.name.lower()]
+    else:
+        matches = all_albums[-10:]
+
+    if not matches:
+        msg = await update.message.reply_text(f"❌ Ничего не найдено по запросу: `{query_str}`", parse_mode="Markdown")
+        delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+        delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
+        return
+
+    if len(matches) == 1:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        album_dir = matches[0]
+        ctx.bot_data["artist_tracks"] = sorted(album_dir.rglob("*.flac"))
+        ctx.bot_data["artist_album_path"] = album_dir
+        text, keyboard = _render_album_artists_view(album_dir)
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    lines = [f"👤 *Выбери альбом для настройки артистов ({len(matches)}):*\n"]
+    buttons = []
+    for i, d in enumerate(matches):
+        artist, album = album_info(d)
+        display = f"{artist} — {album}" if album else d.name
+        lines.append(f"{i + 1}. `{d.name}` — {display}")
+        buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"artist:alb:{i}"))
+
+    ctx.bot_data["artist_albums"] = matches
+    ctx.bot_data["artist_cmd_msg_id"] = update.message.message_id
+    keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
+    keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="artist:close")])
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик кнопок управления артистами."""
     query = update.callback_query
-    await query.answer()
-
     if update.effective_user.id != OWNER_ID:
+        await query.answer()
         return
 
     parts = query.data.split(":")
     action = parts[1]
 
     if action == "close":
+        await query.answer()
+        if f"artist_action_{OWNER_ID}" in ctx.bot_data:
+            del ctx.bot_data[f"artist_action_{OWNER_ID}"]
         try:
             await query.delete_message()
         except Exception:
             pass
+        cmd_id = ctx.bot_data.pop("artist_cmd_msg_id", None)
+        if cmd_id:
+            try:
+                await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=cmd_id)
+            except Exception:
+                pass
+        return
+
+    if action == "album":
+        await query.answer()
+        album_name = ":".join(parts[2:])
+        album_dir = LIBRARY / album_name
+        if not album_dir.exists():
+            matches = [d for d in LIBRARY.iterdir() if d.is_dir() and d.name.lower() == album_name.lower()]
+            if matches:
+                album_dir = matches[0]
+
+        if not album_dir.exists():
+            await _safe_edit_message(query, f"❌ Альбом `{album_name}` не найден.")
+            return
+
+        tracks = sorted(album_dir.rglob("*.flac"))
+        if not tracks:
+            await _safe_edit_message(query, "❌ В альбоме нет FLAC-треков.")
+            return
+
+        ctx.bot_data["artist_tracks"] = tracks
+        ctx.bot_data["artist_album_path"] = album_dir
+
+        text, keyboard = _render_album_artists_view(album_dir)
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if action == "alb":
+        await query.answer()
+        idx = int(parts[2])
+        albums = ctx.bot_data.get("artist_albums", [])
+        if not (0 <= idx < len(albums)):
+            return
+
+        cmd_id = ctx.bot_data.pop("artist_cmd_msg_id", None)
+        if cmd_id:
+            try:
+                await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=cmd_id)
+            except Exception:
+                pass
+
+        album_dir = albums[idx]
+        tracks = sorted(album_dir.rglob("*.flac"))
+        ctx.bot_data["artist_tracks"] = tracks
+        ctx.bot_data["artist_album_path"] = album_dir
+
+        text, keyboard = _render_album_artists_view(album_dir)
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if action == "alb_back":
+        await query.answer()
+        if f"artist_action_{OWNER_ID}" in ctx.bot_data:
+            del ctx.bot_data[f"artist_action_{OWNER_ID}"]
+        album_dir = ctx.bot_data.get("artist_album_path")
+        if not album_dir or not album_dir.exists():
+            await _safe_edit_message(query, "⚠️ Сессия устарела. Используй /artist.")
+            return
+
+        ctx.bot_data["artist_tracks"] = sorted(album_dir.rglob("*.flac"))
+        text, keyboard = _render_album_artists_view(album_dir)
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if action == "tr":
+        await query.answer()
+        idx = int(parts[2])
+        tracks = ctx.bot_data.get("artist_tracks", [])
+        if not (0 <= idx < len(tracks)):
+            return
+
+        track_path = tracks[idx]
+        text, keyboard, other = _render_track_artist_card(track_path, idx)
+        ctx.bot_data["artist_track_others"] = other
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if action == "qadd":
+        track_idx = int(parts[2])
+        other_idx = int(parts[3])
+        tracks = ctx.bot_data.get("artist_tracks", [])
+        others = ctx.bot_data.get("artist_track_others", [])
+        if not (0 <= track_idx < len(tracks)) or not (0 <= other_idx < len(others)):
+            await query.answer()
+            return
+
+        track_path = tracks[track_idx]
+        to_add = others[other_idx]
+        add_track_artist(track_path, to_add)
+        await query.answer(f"Добавлен: {to_add}")
+
+        text, keyboard, other = _render_track_artist_card(track_path, track_idx)
+        ctx.bot_data["artist_track_others"] = other
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if action == "del":
+        track_idx = int(parts[2])
+        artist_idx = int(parts[3])
+        tracks = ctx.bot_data.get("artist_tracks", [])
+        if not (0 <= track_idx < len(tracks)):
+            await query.answer()
+            return
+
+        track_path = tracks[track_idx]
+        try:
+            audio = FLAC(str(track_path))
+            artists = audio.get("artist", [])
+            if 0 <= artist_idx < len(artists):
+                target_artist = artists[artist_idx]
+                remove_track_artist(track_path, target_artist)
+                await query.answer(f"Удалён: {target_artist}")
+            else:
+                await query.answer()
+        except Exception as e:
+            log.warning("Ошибка при удалении артиста: %s", e)
+            await query.answer("Ошибка при удалении артиста", show_alert=True)
+            return
+
+        text, keyboard, other = _render_track_artist_card(track_path, track_idx)
+        ctx.bot_data["artist_track_others"] = other
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if action == "add":
+        await query.answer()
+        track_idx = int(parts[2])
+        tracks = ctx.bot_data.get("artist_tracks", [])
+        if not (0 <= track_idx < len(tracks)):
+            return
+
+        track_path = tracks[track_idx]
+        album_dir = ctx.bot_data.get("artist_album_path")
+        others = ctx.bot_data.get("artist_track_others", [])
+
+        try:
+            audio = FLAC(str(track_path))
+            title = audio.get("title", [track_path.stem])[0]
+            current = ", ".join(audio.get("artist", [])) or "—"
+        except Exception:
+            title = track_path.stem
+            current = "—"
+
+        other_hint = f" (например, `{others[0]}`)" if others else ""
+        prompt = (
+            f"➕ *Добавление артиста к треку:*\n🎵 *{title}*\n"
+            f"👤 Текущие артисты: `{current}`\n\n"
+            f"Отправь имя артиста (или нескольких через запятую) ответным сообщением{other_hint}.\n"
+            f"Для отмены отправь команду /cancel."
+        )
+        prompt_msg = await ctx.bot.send_message(chat_id=OWNER_ID, text=prompt, parse_mode="Markdown")
+        ctx.bot_data[f"artist_action_{OWNER_ID}"] = {
+            "type": "add",
+            "track_idx": track_idx,
+            "track_path": str(track_path),
+            "album_dir": str(album_dir) if album_dir else "",
+            "card_msg_id": query.message.message_id,
+            "prompt_msg_id": prompt_msg.message_id,
+        }
+        return
+
+    if action == "editaa":
+        await query.answer()
+        album_dir = ctx.bot_data.get("artist_album_path")
+        if not album_dir or not album_dir.exists():
+            await _safe_edit_message(query, "⚠️ Сессия устарела. Используй /artist.")
+            return
+
+        suggestions = get_album_artist_suggestions(album_dir)
+        ctx.bot_data["artist_aa_suggestions"] = suggestions
+        ctx.bot_data[f"artist_action_{OWNER_ID}"] = {
+            "type": "editaa",
+            "album_dir": str(album_dir),
+            "card_msg_id": query.message.message_id,
+        }
+
+        text, keyboard = _render_album_artist_edit_card(album_dir, suggestions)
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if action == "customaa":
+        await query.answer()
+        album_dir = ctx.bot_data.get("artist_album_path")
+        if not album_dir or not album_dir.exists():
+            await _safe_edit_message(query, "⚠️ Сессия устарела. Используй /artist.")
+            return
+
+        ctx.bot_data[f"artist_action_{OWNER_ID}"] = {
+            "type": "editaa",
+            "album_dir": str(album_dir),
+            "card_msg_id": query.message.message_id,
+        }
+
+        text, keyboard = _render_album_artist_custom_prompt(album_dir)
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if action == "setaa":
+        val_or_clear = parts[2]
+        album_dir = ctx.bot_data.get("artist_album_path")
+        if not album_dir or not album_dir.exists():
+            await query.answer("⚠️ Сессия устарела", show_alert=True)
+            return
+
+        if val_or_clear == "clear":
+            new_aa = "-"
+        else:
+            suggestions = ctx.bot_data.get("artist_aa_suggestions", [])
+            idx = int(val_or_clear)
+            if not (0 <= idx < len(suggestions)):
+                await query.answer()
+                return
+            new_aa = suggestions[idx]
+
+        new_folder, status_text = update_album_artist(album_dir, new_aa)
+        ctx.bot_data["artist_album_path"] = new_folder
+        ctx.bot_data["artist_tracks"] = sorted(new_folder.rglob("*.flac"))
+        if f"artist_action_{OWNER_ID}" in ctx.bot_data:
+            del ctx.bot_data[f"artist_action_{OWNER_ID}"]
+
+        await query.answer(f"✅ {status_text}")
+        text, keyboard = _render_album_artists_view(new_folder)
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+
+@_owner_only
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сбрасывает ожидание ручного ввода текста или редактирования артистов."""
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    waiting_lyrics = f"lyrics_waiting_{OWNER_ID}"
+    waiting_artist = f"artist_action_{OWNER_ID}"
+
+    cancelled = False
+    if waiting_lyrics in ctx.bot_data:
+        data = ctx.bot_data.pop(waiting_lyrics)
+        prompt_id = data.get("prompt_msg_id") if isinstance(data, dict) else None
+        if prompt_id:
+            try:
+                await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=prompt_id)
+            except Exception:
+                pass
+        cancelled = True
+
+    if waiting_artist in ctx.bot_data:
+        data = ctx.bot_data.pop(waiting_artist)
+        prompt_id = data.get("prompt_msg_id") if isinstance(data, dict) else None
+        if prompt_id:
+            try:
+                await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=prompt_id)
+            except Exception:
+                pass
+        cancelled = True
+
+    text = "Действие отменено." if cancelled else "Нет активных действий для отмены."
+    msg = await ctx.bot.send_message(chat_id=OWNER_ID, text=text)
+    delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=3.0)
+
+
+async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик кнопок управления текстами."""
+    query = update.callback_query
+    if update.effective_user.id != OWNER_ID:
+        await query.answer()
+        return
+
+    parts = query.data.split(":")
+    action = parts[1]
+
+    # Для action == "src" не вызываем query.answer() сразу, чтобы показать результат
+    if action != "src":
+        await query.answer()
+
+    if action == "close":
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        cmd_id = ctx.bot_data.pop("lyrics_cmd_msg_id", None)
+        if cmd_id:
+            try:
+                await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=cmd_id)
+            except Exception:
+                pass
         return
 
     if action == "album":
@@ -842,24 +1621,19 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                 album_dir = matches[0]
 
         if not album_dir.exists():
-            await query.edit_message_text(f"❌ Альбом `{album_name}` не найден.")
+            await _safe_edit_message(query, f"❌ Альбом `{album_name}` не найден.")
             return
 
         tracks = sorted(album_dir.rglob("*.flac"))
         if not tracks:
-            await query.edit_message_text("❌ В альбоме нет FLAC-треков.")
+            await _safe_edit_message(query, "❌ В альбоме нет FLAC-треков.")
             return
 
         ctx.bot_data["lyrics_tracks"] = tracks
         ctx.bot_data["lyrics_album_path"] = album_dir
 
         text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks)
-        await ctx.bot.send_message(
-            chat_id=OWNER_ID,
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if action == "alb":
@@ -867,24 +1641,32 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         albums = ctx.bot_data.get("lyrics_albums", [])
         if not (0 <= idx < len(albums)):
             return
+
+        cmd_id = ctx.bot_data.pop("lyrics_cmd_msg_id", None)
+        if cmd_id:
+            try:
+                await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=cmd_id)
+            except Exception:
+                pass
+
         album_dir = albums[idx]
         tracks = sorted(album_dir.rglob("*.flac"))
         ctx.bot_data["lyrics_tracks"] = tracks
         ctx.bot_data["lyrics_album_path"] = album_dir
 
         text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if action == "back":
         album_dir = ctx.bot_data.get("lyrics_album_path")
         tracks = ctx.bot_data.get("lyrics_tracks")
         if not album_dir or not tracks:
-            await query.edit_message_text("⚠️ Сессия устарела. Используй /lyrics.")
+            await _safe_edit_message(query, "⚠️ Сессия устарела. Используй /lyrics.")
             return
 
         text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if action == "tr":
@@ -895,7 +1677,7 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
         track_path = tracks[idx]
         text, keyboard = _render_track_lyrics_card(track_path, idx)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if action == "src":
@@ -903,6 +1685,7 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         idx = int(parts[3])
         tracks = ctx.bot_data.get("lyrics_tracks", [])
         if not (0 <= idx < len(tracks)):
+            await query.answer()
             return
 
         track_path = tracks[idx]
@@ -918,8 +1701,6 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         source_names = {"lrclib": "LRCLIB", "genius": "Genius"}
         src_name = source_names.get(source, source)
 
-        await query.answer(f"🔍 Ищу на {src_name}…")
-
         lm = LyricManager()
         loop = asyncio.get_running_loop()
         res = await loop.run_in_executor(
@@ -930,13 +1711,24 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             await query.answer(f"😕 На {src_name} текст не найден", show_alert=True)
             return
 
-        # Сохраняем найденный текст
+        # Проверяем, изменился ли текст
         lrc_path = track_path.with_suffix(".lrc")
+        already_identical = False
+        if lrc_path.exists():
+            try:
+                already_identical = lrc_path.read_text(encoding="utf-8").strip() == res.text.strip()
+            except Exception:
+                pass
+
         lrc_path.write_text(res.text, encoding="utf-8")
 
-        await query.answer(f"✅ Текст успешно обновлён из {src_name}!")
+        if already_identical:
+            await query.answer(f"ℹ️ Этот текст уже загружен из {src_name}")
+        else:
+            await query.answer(f"✅ Текст загружен из {src_name}!")
+
         text, keyboard = _render_track_lyrics_card(track_path, idx)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if action == "man":
@@ -946,7 +1738,6 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         track_path = tracks[idx]
-        ctx.bot_data[f"lyrics_waiting_{OWNER_ID}"] = str(track_path)
 
         try:
             audio = FLAC(str(track_path))
@@ -961,52 +1752,156 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             f"Отправь мне текст песни сообщением в ответ или прикрепи файл `.lrc` документом.\n"
             f"Для отмены отправь команду /cancel."
         )
-        await ctx.bot.send_message(chat_id=OWNER_ID, text=prompt, parse_mode="Markdown")
+        prompt_msg = await ctx.bot.send_message(chat_id=OWNER_ID, text=prompt, parse_mode="Markdown")
+        ctx.bot_data[f"lyrics_waiting_{OWNER_ID}"] = {
+            "track_path": str(track_path),
+            "track_idx": idx,
+            "prompt_msg_id": prompt_msg.message_id,
+            "card_msg_id": query.message.message_id,
+        }
         return
 
 
 async def on_owner_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает присланные владельцем файлы .lrc или текст песен."""
+    """Обрабатывает присланные владельцем файлы/текст для lyrics или artist."""
     if update.effective_user.id != OWNER_ID:
         return
 
+    # Всегда удаляем входящее сообщение пользователя с текстом/файлом, чтобы не засорять историю чата
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    # 1. Режим настройки артистов
+    artist_key = f"artist_action_{OWNER_ID}"
+    if artist_key in ctx.bot_data:
+        action_data = ctx.bot_data.pop(artist_key)
+
+        prompt_id = action_data.get("prompt_msg_id")
+        if prompt_id:
+            try:
+                await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=prompt_id)
+            except Exception:
+                pass
+
+        user_text = (update.message.text or "").strip()
+        if not user_text:
+            warn = await ctx.bot.send_message(chat_id=OWNER_ID, text="❌ Пустой ввод. Действие отменено.")
+            delete_later(ctx.bot, OWNER_ID, warn.message_id, delay=3.0)
+            return
+
+        if action_data["type"] == "add":
+            track_path = Path(action_data["track_path"])
+            updated_artists = add_track_artist(track_path, user_text)
+            card_id = action_data.get("card_msg_id")
+            track_idx = action_data.get("track_idx")
+
+            if card_id and track_idx is not None:
+                text, keyboard, other = _render_track_artist_card(track_path, track_idx)
+                ctx.bot_data["artist_track_others"] = other
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=OWNER_ID,
+                        message_id=card_id,
+                        text=text,
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                    )
+                except Exception:
+                    pass
+
+            conf = await ctx.bot.send_message(
+                chat_id=OWNER_ID,
+                text=f"✅ Артист `{user_text}` добавлен в трек!",
+                parse_mode="Markdown",
+            )
+            delete_later(ctx.bot, OWNER_ID, conf.message_id, delay=3.0)
+            return
+
+        if action_data["type"] == "editaa":
+            album_dir = Path(action_data["album_dir"])
+            new_folder, status_text = update_album_artist(album_dir, user_text)
+            ctx.bot_data["artist_album_path"] = new_folder
+            ctx.bot_data["artist_tracks"] = sorted(new_folder.rglob("*.flac"))
+
+            card_id = action_data.get("card_msg_id")
+            if card_id:
+                text, keyboard = _render_album_artists_view(new_folder)
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=OWNER_ID,
+                        message_id=card_id,
+                        text=text,
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                    )
+                except Exception:
+                    pass
+
+            conf = await ctx.bot.send_message(
+                chat_id=OWNER_ID,
+                text=f"✅ *{status_text}*\n📂 `{new_folder.name}`",
+                parse_mode="Markdown",
+            )
+            delete_later(ctx.bot, OWNER_ID, conf.message_id, delay=3.0)
+            return
+
+    # 2. Режим ручного ввода текста песни (.lrc или текст)
     waiting_key = f"lyrics_waiting_{OWNER_ID}"
-    track_path_str = ctx.bot_data.get(waiting_key)
-    if not track_path_str:
+    if waiting_key in ctx.bot_data:
+        waiting_data = ctx.bot_data.pop(waiting_key)
+
+        prompt_id = waiting_data.get("prompt_msg_id")
+        if prompt_id:
+            try:
+                await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=prompt_id)
+            except Exception:
+                pass
+
+        track_path = Path(waiting_data["track_path"])
+        track_idx = waiting_data["track_idx"]
+        card_id = waiting_data.get("card_msg_id")
+
+        text_to_save = ""
+        if update.message.document:
+            doc = update.message.document
+            file_obj = await doc.get_file()
+            file_bytes = await file_obj.download_as_bytearray()
+            text_to_save = file_bytes.decode("utf-8", errors="replace").strip()
+        elif update.message.text:
+            text_to_save = update.message.text.strip()
+
+        if not text_to_save:
+            warn = await ctx.bot.send_message(chat_id=OWNER_ID, text="❌ Пустой текст. Отправка отменена.")
+            delete_later(ctx.bot, OWNER_ID, warn.message_id, delay=3.0)
+            return
+
+        lrc_path = track_path.with_suffix(".lrc")
+        lrc_path.write_text(text_to_save, encoding="utf-8")
+
+        if card_id:
+            text, keyboard = _render_track_lyrics_card(track_path, track_idx)
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=OWNER_ID,
+                    message_id=card_id,
+                    text=text,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+            except Exception:
+                pass
+
+        is_sync = has_timestamps(text_to_save)
+        status = "караоке ✨" if is_sync else "обычный текст 📄"
+        conf = await ctx.bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"✅ Текст сохранён ({status}) для `{track_path.name}`!",
+            parse_mode="Markdown",
+        )
+        delete_later(ctx.bot, OWNER_ID, conf.message_id, delay=3.0)
         return
-
-    track_path = Path(track_path_str)
-    text_to_save = ""
-
-    # Если отправлен документ (.lrc / .txt)
-    if update.message.document:
-        doc = update.message.document
-        file_obj = await doc.get_file()
-        file_bytes = await file_obj.download_as_bytearray()
-        text_to_save = file_bytes.decode("utf-8", errors="replace").strip()
-
-    # Если отправлен обычный текст
-    elif update.message.text:
-        text_to_save = update.message.text.strip()
-
-    if not text_to_save:
-        await update.message.reply_text("❌ Пустой текст. Отправка отменена.")
-        del ctx.bot_data[waiting_key]
-        return
-
-    lrc_path = track_path.with_suffix(".lrc")
-    lrc_path.write_text(text_to_save, encoding="utf-8")
-    del ctx.bot_data[waiting_key]
-
-    is_sync = has_timestamps(text_to_save)
-    status = "караоке ✨" if is_sync else "обычный текст 📄"
-
-    await update.message.reply_text(
-        f"✅ *Текст песни успешно сохранён!*\n"
-        f"📂 `{lrc_path.name}` ({status})\n\n"
-        f"📝 *Превью:*\n```\n{preview_lyrics(text_to_save, 6)}\n```",
-        parse_mode="Markdown",
-    )
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
@@ -1016,14 +1911,19 @@ async def post_init(app: Application) -> None:
     async def on_release(folder: Path) -> None:
         await _on_new_release(folder, app)
 
-    asyncio.create_task(watch_inbox(INBOX, on_release))
+    def is_busy() -> bool:
+        session = _sessions.get(OWNER_ID)
+        return session is not None and session.state != SessionState.DONE
+
+    asyncio.create_task(watch_inbox(INBOX, on_release, is_busy=is_busy))
     log.info("Inbox watcher задача создана")
 
     try:
-        await app.bot.send_message(
+        msg = await app.bot.send_message(
             chat_id=OWNER_ID,
             text="🟢 NaviSan бот запущен. Слежу за Inbox.",
         )
+        delete_later(app.bot, OWNER_ID, msg.message_id, delay=5.0)
     except Exception:
         log.warning("Не удалось отправить приветственное сообщение")
 
@@ -1035,19 +1935,24 @@ def main() -> None:
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("upgrade", cmd_upgrade))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("cover", cmd_cover))
     app.add_handler(CommandHandler("lyrics", cmd_lyrics))
+    app.add_handler(CommandHandler("artist", cmd_artist))
     app.add_handler(CommandHandler("process", cmd_process))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     # Callback-кнопки
+    app.add_handler(CallbackQueryHandler(on_upgrade_callback, pattern=r"^upgrade:"))
     app.add_handler(CallbackQueryHandler(on_cover_callback, pattern=r"^cover:"))
     app.add_handler(CallbackQueryHandler(on_scan_callback, pattern=r"^scan:"))
     app.add_handler(CallbackQueryHandler(on_recover_callback, pattern=r"^recover:"))
     app.add_handler(CallbackQueryHandler(on_lyrics_callback, pattern=r"^lyrics:"))
+    app.add_handler(CallbackQueryHandler(on_artist_callback, pattern=r"^artist:"))
+    app.add_handler(CallbackQueryHandler(on_report_callback, pattern=r"^report:"))
 
-    # Сообщения владельца (текст или документы .lrc для ручного ввода текста песни)
+    # Сообщения владельца (текст или документы .lrc для ручного ввода текста песни или имени артиста)
     app.add_handler(MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, on_owner_message))
 
     app.post_init = post_init

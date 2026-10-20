@@ -58,6 +58,14 @@ class FileSystemManager:
 
         if path != new_path:
             path.rename(new_path)
+            # Если рядом был .lrc файл со старым именем, переименовываем его тоже
+            old_lrc = path.with_suffix(".lrc")
+            new_lrc = new_path.with_suffix(".lrc")
+            if old_lrc.exists():
+                try:
+                    old_lrc.rename(new_lrc)
+                except Exception as e:
+                    log.warning("Не удалось переименовать .lrc: %s", e)
             log.debug("Файл переименован: %s -> %s", path.name, new_filename)
             return str(new_path)
 
