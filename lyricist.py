@@ -1,22 +1,15 @@
 """Поиск, загрузка и управление текстами песен (.lrc / plain text).
 
-Каскадный водопад поиска (Waterfall):
-  1. Синхронизированный текст (Караоке с таймкодами):
-     - LRCLIB (synced)
-     - Lyricsify (synced)
-     - Яндекс Музыка (synced)
-  2. Обычный текст (Plain, если караоке не найдено нигде):
-     - LRCLIB (plain)
-     - Genius (plain)
-     - Яндекс Музыка (plain)
+Каскадный водопад поиска:
+  1. LRCLIB (synced) — синхронизированный караоке-текст с таймкодами.
+  2. LRCLIB (plain)  — обычный текст без таймкодов, если караоке не найдено.
+  3. Genius (plain)  — эталонный текст с Genius.com как надёжный универсальный фоллбэк.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import re
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,23 +20,28 @@ from mutagen.flac import FLAC
 log = logging.getLogger(__name__)
 
 
+# ── Модель ───────────────────────────────────────────────────────────────────
+
 @dataclass(frozen=True, slots=True)
 class LyricResult:
     """Результат поиска текста песни."""
+
     text: str                # Содержимое (LRC с таймкодами или обычный текст)
     is_synced: bool          # True, если текст синхронизированный (караоке)
-    source: str              # "lrclib" | "lyricsify" | "yandex" | "genius" | "manual"
+    source: str              # "lrclib" | "genius" | "manual"
     track_title: str = ""
     artist: str = ""
 
 
+# ── Вспомогательные функции ──────────────────────────────────────────────────
+
 def has_timestamps(text: str) -> bool:
-    """Проверяет, содержит ли текст временные метки вида [mm:ss.xx]."""
+    """Проверяет, содержит ли текст временные метки караоке вида [mm:ss.xx]."""
     return bool(re.search(r"\[\d{2}:\d{2}", text))
 
 
 def preview_lyrics(text: str, max_lines: int = 6) -> str:
-    """Возвращает превью первых N строк текста."""
+    """Возвращает компактное превью первых N строк текста."""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     preview = lines[:max_lines]
     if len(lines) > max_lines:
@@ -51,17 +49,16 @@ def preview_lyrics(text: str, max_lines: int = 6) -> str:
     return "\n".join(preview)
 
 
+# ── Менеджер текстов ──────────────────────────────────────────────────────────
+
 class LyricManager:
-    """Управление поиском, конвертацией и сохранением текстов песен."""
+    """Поиск, загрузка и форматирование текстов песен."""
 
     LRCLIB_UA = "NaviSan/1.0 (https://github.com/arsen/navisan)"
     BROWSER_UA = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
-
-    def __init__(self, yandex_token: str | None = None) -> None:
-        self.yandex_token = yandex_token or os.environ.get("YANDEX_MUSIC_TOKEN")
 
     # ── 1. LRCLIB ─────────────────────────────────────────────────────────────
 
@@ -72,8 +69,14 @@ class LyricManager:
         album: str = "",
         duration: int = 0,
     ) -> tuple[LyricResult | None, LyricResult | None]:
-        """Ищет текст в LRCLIB. Возвращает кортеж (synced_result, plain_result)."""
+        """Ищет текст в LRCLIB через точный и мягкий поиск.
+
+        Returns:
+            Кортеж (synced_result, plain_result).
+        """
         headers = {"User-Agent": self.LRCLIB_UA}
+
+        # Шаг 1: Точный поиск по метаданным
         exact_params = {
             "artist_name": artist,
             "track_name": title,
@@ -104,9 +107,9 @@ class LyricManager:
                 if res_synced or res_plain:
                     return res_synced, res_plain
         except Exception as e:
-            log.debug("LRCLIB exact error: %s", e)
+            log.debug("LRCLIB exact match error: %s", e)
 
-        # Мягкий поиск
+        # Шаг 2: Мягкий поиск по ключевым словам
         try:
             r = requests.get(
                 "https://lrclib.net/api/search",
@@ -140,143 +143,10 @@ class LyricManager:
 
         return None, None
 
-    # ── 2. Lyricsify ──────────────────────────────────────────────────────────
-
-    def _fetch_lyricsify(self, artist: str, title: str) -> LyricResult | None:
-        """Ищет текст на Lyricsify.com."""
-        headers = {
-            "User-Agent": self.BROWSER_UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Referer": "https://www.lyricsify.com/",
-        }
-        try:
-            r = requests.get(
-                "https://www.lyricsify.com/search",
-                params={"q": f"{artist} {title}"},
-                headers=headers,
-                timeout=8,
-            )
-            if r.status_code != 200:
-                return None
-
-            soup = BeautifulSoup(r.text, "html.parser")
-            # Находим ссылки на треки в результатах поиска
-            link = soup.find("a", href=lambda h: h and h.startswith("/lyric/"))
-            if not link:
-                return None
-
-            track_url = f"https://www.lyricsify.com{link['href']}"
-            track_resp = requests.get(track_url, headers=headers, timeout=8)
-            if track_resp.status_code != 200:
-                return None
-
-            t_soup = BeautifulSoup(track_resp.text, "html.parser")
-            lyrics_box = t_soup.find("div", id="lyrics_box") or t_soup.find("pre")
-            if lyrics_box:
-                text = lyrics_box.get_text().strip()
-                if text:
-                    is_sync = has_timestamps(text)
-                    return LyricResult(text=text, is_synced=is_sync, source="lyricsify", track_title=title, artist=artist)
-        except Exception as e:
-            log.debug("Lyricsify error: %s", e)
-
-        return None
-
-    # ── 3. Яндекс Музыка ──────────────────────────────────────────────────────
-
-    def _fetch_yandex(self, artist: str, title: str) -> tuple[LyricResult | None, LyricResult | None]:
-        """Ищет текст на Яндекс Музыке. Возвращает (synced_result, plain_result)."""
-        headers = {
-            "User-Agent": "YandexMusic/2024.08.1 (Android; 14; sdk 34)",
-            "Accept": "application/json",
-        }
-        if self.yandex_token:
-            headers["Authorization"] = f"OAuth {self.yandex_token}"
-
-        try:
-            r = requests.get(
-                "https://api.music.yandex.net/search",
-                params={"text": f"{artist} {title}", "type": "track", "page": 0},
-                headers=headers,
-                timeout=8,
-            )
-            if r.status_code != 200:
-                return None, None
-
-            tracks = r.json().get("result", {}).get("tracks", {}).get("results", [])
-            if not tracks:
-                return None, None
-
-            track_id = tracks[0].get("id")
-            if not track_id:
-                return None, None
-
-            supp_r = requests.get(
-                f"https://api.music.yandex.net/tracks/{track_id}/supplement",
-                headers=headers,
-                timeout=8,
-            )
-            if supp_r.status_code != 200:
-                return None, None
-
-            lyrics_info = supp_r.json().get("result", {}).get("lyrics", {})
-            if not lyrics_info:
-                return None, None
-
-            sync_type = lyrics_info.get("syncType", "").upper()
-            down_url = lyrics_info.get("downloadUrl")
-            full_lyrics = lyrics_info.get("fullLyrics", "")
-
-            # Синхронизированный текст
-            if sync_type in ("LINE", "WORD") and down_url:
-                down_r = requests.get(down_url, headers=headers, timeout=8)
-                if down_r.status_code == 200:
-                    lrc_text = self._convert_yandex_to_lrc(down_r.text)
-                    if lrc_text:
-                        synced_res = LyricResult(
-                            text=lrc_text, is_synced=True, source="yandex", track_title=title, artist=artist
-                        )
-                        plain_res = (
-                            LyricResult(text=full_lyrics, is_synced=False, source="yandex", track_title=title, artist=artist)
-                            if full_lyrics
-                            else None
-                        )
-                        return synced_res, plain_res
-
-            if full_lyrics:
-                return None, LyricResult(
-                    text=full_lyrics, is_synced=False, source="yandex", track_title=title, artist=artist
-                )
-        except Exception as e:
-            log.debug("Yandex music lyrics error: %s", e)
-
-        return None, None
-
-    def _convert_yandex_to_lrc(self, content: str) -> str:
-        """Преобразует XML от Яндекс Музыки в стандартный LRC."""
-        if content.strip().startswith("<"):
-            try:
-                root = ET.fromstring(content)
-                lines = []
-                for line in root.findall(".//line"):
-                    start_ms = int(line.get("start", 0))
-                    text = (line.text or "").strip()
-                    m = start_ms // 60000
-                    s = (start_ms % 60000) // 1000
-                    cs = (start_ms % 1000) // 10
-                    lines.append(f"[{m:02d}:{s:02d}.{cs:02d}] {text}")
-                return "\n".join(lines)
-            except Exception:
-                pass
-
-        if has_timestamps(content):
-            return content.strip()
-        return ""
-
-    # ── 4. Genius ─────────────────────────────────────────────────────────────
+    # ── 2. Genius ─────────────────────────────────────────────────────────────
 
     def _fetch_genius(self, artist: str, title: str) -> LyricResult | None:
-        """Ищет эталонный текст песни на Genius.com."""
+        """Ищет эталонный текст песни на Genius.com без авторизации."""
         headers = {"User-Agent": self.BROWSER_UA}
         try:
             r = requests.get(
@@ -297,7 +167,7 @@ class LyricManager:
             if not hits:
                 return None
 
-            # Ищем наиболее точный хит, отсеивая переводы (Translations)
+            # Отсеиваем переводы (Translations) и выбираем лучшее совпадение по артисту
             best_hit = None
             artist_parts = [p.lower() for p in artist.split() if len(p) > 2]
             for h in hits:
@@ -323,7 +193,7 @@ class LyricManager:
 
             soup = BeautifulSoup(page.text, "html.parser")
 
-            # Удаляем мусорные блоки шапки Genius и сайдбаров
+            # Удаляем служебные шапки контрибьюторов и сайдбары Genius
             for bad in soup.find_all(class_=lambda cl: cl and any(x in cl for x in ["LyricsHeader", "LyricsEditDesktop", "Sidebar"])):
                 bad.decompose()
 
@@ -351,7 +221,7 @@ class LyricManager:
 
         return None
 
-    # ── Каскадный поиск (Waterfall) ───────────────────────────────────────────
+    # ── Каскадный поиск ───────────────────────────────────────────────────────
 
     def find_lyrics(
         self,
@@ -361,68 +231,35 @@ class LyricManager:
         duration: int = 0,
         preferred_source: str | None = None,
     ) -> LyricResult | None:
-        """Ищет текст песни по водопаду или по конкретному источнику."""
-        # 1. Прямой поиск по указанному источнику
+        """Выполняет поиск текста по каскаду или по указанному источнику."""
+        # 1. Точечный поиск по выбранному сервису
         if preferred_source == "lrclib":
             synced, plain = self._fetch_lrclib(artist, title, album, duration)
             return synced or plain
         if preferred_source == "genius":
             return self._fetch_genius(artist, title)
-        if preferred_source == "yandex":
-            synced, plain = self._fetch_yandex(artist, title)
-            return synced or plain
-        if preferred_source == "lyricsify":
-            return self._fetch_lyricsify(artist, title)
 
         # 2. Автоматический каскад:
-        # ── ФАЗА 1: Синхронизированный текст (Караоке с таймкодами) ──
-        log.info("Поиск караоке для: %s — %s", artist, title)
-
-        # Шаг 1. LRCLIB (synced)
+        # Фаза 1: Синхронизированный текст (Караоке с таймкодами)
         lrclib_synced, lrclib_plain = self._fetch_lrclib(artist, title, album, duration)
         if lrclib_synced:
             log.info("  ✓ Найдено караоке [LRCLIB]: %s — %s", artist, title)
             return lrclib_synced
 
-        # Шаг 2. Lyricsify (synced)
-        lyricsify_res = self._fetch_lyricsify(artist, title)
-        if lyricsify_res and lyricsify_res.is_synced:
-            log.info("  ✓ Найдено караоке [Lyricsify]: %s — %s", artist, title)
-            return lyricsify_res
-
-        # Шаг 3. Яндекс Музыка (synced)
-        yandex_synced, yandex_plain = self._fetch_yandex(artist, title)
-        if yandex_synced:
-            log.info("  ✓ Найдено караоке [Яндекс]: %s — %s", artist, title)
-            return yandex_synced
-
-        # ── ФАЗА 2: Обычный текст (Plain), если караоке не найдено нигде ──
-        log.info("Караоке не найдено. Ищу обычный текст: %s — %s", artist, title)
-
-        # Шаг 4. LRCLIB (plain)
+        # Фаза 2: Обычный текст (Plain)
         if lrclib_plain:
             log.info("  ✓ Найден текст [LRCLIB]: %s — %s", artist, title)
             return lrclib_plain
 
-        # Шаг 5. Genius (plain)
         genius_plain = self._fetch_genius(artist, title)
         if genius_plain:
             log.info("  ✓ Найден текст [Genius]: %s — %s", artist, title)
             return genius_plain
 
-        # Шаг 6. Яндекс Музыка (plain)
-        if yandex_plain:
-            log.info("  ✓ Найден текст [Яндекс]: %s — %s", artist, title)
-            return yandex_plain
-
-        # Шаг 7. Несинхронизированный Lyricsify (если был)
-        if lyricsify_res:
-            return lyricsify_res
-
-        log.info("  ❌ Текст не найден ни на одном сервисе: %s — %s", artist, title)
+        log.info("  ❌ Текст не найден: %s — %s", artist, title)
         return None
 
-    # ── Обработка файла ───────────────────────────────────────────────────────
+    # ── Обработка файлов ──────────────────────────────────────────────────────
 
     def process_file(self, filepath: str | Path, overwrite: bool = False) -> str:
         """Скачивает текст по водопаду и сохраняет .lrc файл рядом с треком.
@@ -437,7 +274,6 @@ class LyricManager:
 
         lrc_path = path.with_suffix(".lrc")
         if not overwrite and lrc_path.exists():
-            # Если уже есть файл, определяем его тип для красивого отчёта
             try:
                 content = lrc_path.read_text(encoding="utf-8")
                 return "Караоке ✨" if has_timestamps(content) else "Текст 📄"
@@ -457,13 +293,7 @@ class LyricManager:
             res = self.find_lyrics(artist, title, album, duration)
             if res and res.text:
                 lrc_path.write_text(res.text, encoding="utf-8")
-                source_label = {
-                    "lrclib": "LRCLIB",
-                    "yandex": "Яндекс",
-                    "genius": "Genius",
-                    "lyricsify": "Lyricsify",
-                    "manual": "Вручную",
-                }.get(res.source, res.source.upper())
+                source_label = "LRCLIB" if res.source == "lrclib" else "Genius"
 
                 if res.is_synced:
                     return f"Караоке [{source_label}] ✨"

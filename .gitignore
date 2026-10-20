@@ -41,9 +41,6 @@ cover.jpg
 # Docs
 docs/
 
-# Old obsolete test entry point
-main.py
-
 # AI assistants, IDEs, and OS artifacts
 CLAUDE.md
 CONTEXT.md
