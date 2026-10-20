@@ -1,4 +1,5 @@
 anyio==4.15.1
+beautifulsoup4==4.15.0
 certifi==2026.7.22
 charset-normalizer==3.5.2
 h11==0.16.0
@@ -9,5 +10,6 @@ mutagen==1.48.1
 python-dotenv==1.2.4
 python-telegram-bot==22.8
 requests==2.34.2
+soupsieve==3.0.3
 typing_extensions==4.16.0
 urllib3==2.8.0
