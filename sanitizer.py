@@ -80,22 +80,74 @@ class TagSanitizer:
 
         return None
 
+    def _get_compound_artists_from_db(self) -> set[str]:
+        """Возвращает из navidrome.db имена артистов, содержащие разделители (, & and)."""
+        if not os.path.exists(self.db_path):
+            return set()
+        res = set()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT name FROM artist WHERE name LIKE '%,%' OR name LIKE '%&%' OR name LIKE '% and %'"
+                )
+                for r in cursor.fetchall():
+                    val = str(r[0]).strip()
+                    if val and len(val) < 80:
+                        res.add(val.lower())
+        except sqlite3.Error as e:
+            log.debug("Ошибка чтения составных артистов из Navidrome: %s", e)
+        return res
+
     def process_artists(self, raw_artist_string: str) -> list[str]:
-        """Разбивает строку артистов и приводит каждое имя к каноническому виду.
+        """Разбивает строку артистов и приводит каждое имя к каноническому виду."""
+        raw_str = (raw_artist_string or "").strip()
+        if not raw_str:
+            return []
 
-        Args:
-            raw_artist_string: Исходная строка из тега ARTIST (например, "A feat. B & C").
+        # 1. Быстрая проверка: полное совпадение со словарём алиасов или базой Navidrome
+        raw_lower = raw_str.lower()
+        if raw_lower in self.aliases:
+            return [self.aliases[raw_lower]]
+        db_match = self._get_artist_from_db(raw_str)
+        if db_match:
+            return [db_match]
 
-        Returns:
-            Список очищенных уникальных имён артистов в порядке появления.
-        """
-        split_artists = self.split_pattern.split(raw_artist_string)
+        # 2. Формируем список составных артистов только из aliases.json и navidrome.db
+        protected = set()
+        for k, v in self.aliases.items():
+            if any(c in k for c in (",", ";", "&")) or " and " in k.lower():
+                protected.add(k.lower())
+            if any(c in v for c in (",", ";", "&")) or " and " in v.lower():
+                protected.add(v.lower())
+        protected.update(self._get_compound_artists_from_db())
+
+        # 3. Экранирование защищённых групп токенами перед сплитом
+        sorted_prot = sorted(protected, key=len, reverse=True)
+        tokens: dict[str, str] = {}
+        masked = raw_str
+
+        for p in sorted_prot:
+            pattern = re.compile(r"(?<!\w)" + re.escape(p) + r"(?!\w)", re.IGNORECASE)
+            def repl(m: re.Match) -> str:
+                tok = f"\x00PROT_{len(tokens)}\x00"
+                tokens[tok] = m.group(0)
+                return tok
+            masked = pattern.sub(repl, masked)
+
+        # 4. Разделение по разделителям
+        split_artists = self.split_pattern.split(masked)
         clean_artists: list[str] = []
 
         for artist in split_artists:
             artist = artist.strip()
             if not artist:
                 continue
+
+            # Восстанавливаем защищённые токены
+            for tok, orig in tokens.items():
+                if tok in artist:
+                    artist = artist.replace(tok, orig)
 
             artist_lower = artist.lower()
 

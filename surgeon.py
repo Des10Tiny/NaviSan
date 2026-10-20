@@ -87,6 +87,13 @@ class FLACSurgeon:
             log.error("Файл повреждён или не читается: %s (%s)", path.name, e)
             return
 
+        # 0. Нормализация тегов лейбла (ORGANIZATION / PUBLISHER -> LABEL)
+        if "label" not in audio:
+            for alt in ("organization", "publisher", "recordlabel", "record_label"):
+                if alt in audio:
+                    audio["label"] = audio[alt]
+                    break
+
         # 1. Фильтрация по whitelist тегов и очистка мусорных значений
         saved_tags: dict[str, list[str]] = {}
         for key in list(audio.keys()):

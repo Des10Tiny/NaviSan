@@ -164,7 +164,15 @@ def apply_pipeline(
         surgeon.heal_file(str(flac))
         new_path = renamer.rename_file(str(flac))
         lrc_status = lyricist.process_file(new_path)
-        report.append(f"• `{Path(new_path).name}` — {lrc_status}")
+        track_artist_str = ""
+        try:
+            audio = FLAC(str(new_path))
+            arts = audio.get("artist", [])
+            if arts:
+                track_artist_str = f" (👤 {', '.join(arts)})"
+        except Exception:
+            pass
+        report.append(f"• `{Path(new_path).name}`{track_artist_str} — {lrc_status}")
 
     # Переименовываем папку альбома последней (пути выше уже отработали).
     new_folder = Path(renamer.rename_album_folder(str(folder)))
@@ -380,6 +388,49 @@ def update_album_artist(folder: Path, new_album_artist: str) -> tuple[Path, str]
     return Path(new_folder_str), status_str
 
 
+def replace_all_tracks_artist(folder: Path, new_artist: str) -> tuple[Path, str]:
+    """Заменяет основного исполнителя во всех треках альбома, обновляет ALBUMARTIST и имя папки."""
+    flac_files = sorted(folder.rglob("*.flac"))
+    if not flac_files:
+        return folder, "В папке нет FLAC-файлов."
+
+    raw = new_artist.strip()
+    if not raw:
+        return folder, "Имя артиста не может быть пустым."
+
+    # Сохраняем имя ровно так, как ввёл пользователь (без принудительного сплита)
+    artists_list = [raw]
+
+    for f in flac_files:
+        try:
+            audio = FLAC(str(f))
+            audio["artist"] = artists_list
+            audio["albumartist"] = artists_list
+            audio.save()
+        except Exception as e:
+            log.warning("Не удалось обновить артиста в %s: %s", f.name, e)
+
+    renamer = FileSystemManager()
+    new_folder_str = renamer.rename_album_folder(str(folder))
+    status_str = f"Исполнитель во всех треках обновлён на: {raw}"
+    return Path(new_folder_str), status_str
+
+
+def set_track_artists(track_path: Path, new_artists_str: str) -> list[str]:
+    """Устанавливает точное имя артиста для одного трека (без ошибочного сплита)."""
+    raw = new_artists_str.strip()
+    if not raw:
+        return []
+    artists_list = [raw]
+    try:
+        audio = FLAC(str(track_path))
+        audio["artist"] = artists_list
+        audio.save()
+    except Exception as e:
+        log.warning("Не удалось установить артистов для %s: %s", track_path.name, e)
+    return artists_list
+
+
 # ── Пакетная идеализация библиотеки ──────────────────────────────────────────
 
 def album_has_cover(album_dir: Path) -> bool:
@@ -405,20 +456,32 @@ def upgrade_album(
 ) -> dict:
     """Выполняет полную стандартизацию («идеализацию») альбома на месте.
 
-    1. Проверяет обложку: если её нет (или force_cover=True), ищет и вшивает.
-    2. Очищает и нормализует теги (FLACSurgeon + TagSanitizer).
-    3. Ищет и сохраняет недостающие караоке-тексты (.lrc).
-    4. Приводит имена треков к '01. Title.flac' и папки к 'Artist - Album'.
+    1. Очищает и нормализует теги всех треков (FLACSurgeon + TagSanitizer).
+    2. Проверяет обложку: если её нет (или force_cover=True), ищет и вшивает.
+    3. Переименовывает треки в '01. Title.flac' и ищет синхронизированные тексты (.lrc).
+    4. Приводит имя папки релиза к 'Artist - Album'.
     """
     flac_files = sorted(album_dir.rglob("*.flac"))
     if not flac_files:
         return {"error": "no_flacs", "folder": album_dir.name}
 
-    artist, album = album_info(album_dir)
+    sanitizer = TagSanitizer(aliases_path=aliases_path, db_path=db_path)
+    surgeon = FLACSurgeon(sanitizer=sanitizer)
+    renamer = FileSystemManager()
+    lyricist = LyricManager()
+
     cover_added = False
     lyrics_added = 0
 
-    # 1. Обложка: проверяем и сохраняем существующую, ищем только если отсутствует
+    # Шаг 1: Первым делом чистим и нормализуем метаданные во всех треках
+    for flac in flac_files:
+        try:
+            surgeon.heal_file(str(flac))
+        except Exception as e:
+            log.warning("Ошибка очистки тегов в треке %s: %s", flac.name, e)
+
+    # Шаг 2: Теперь берём гарантированно чистые artist и album для поиска обложки
+    artist, album = album_info(album_dir)
     if force_cover or not album_has_cover(album_dir):
         if artist and album:
             try:
@@ -430,16 +493,10 @@ def upgrade_album(
             except Exception as e:
                 log.warning("Не удалось найти обложку для %s — %s: %s", artist, album, e)
 
-    # 2. Санитизация тегов, переименование треков и подгрузка .lrc
-    sanitizer = TagSanitizer(aliases_path=aliases_path, db_path=db_path)
-    surgeon = FLACSurgeon(sanitizer=sanitizer)
-    renamer = FileSystemManager()
-    lyricist = LyricManager()
-
+    # Шаг 3: Переименование треков и подгрузка недостающих текстов песен (.lrc)
     flac_files = sorted(album_dir.rglob("*.flac"))
     for flac in flac_files:
         try:
-            surgeon.heal_file(str(flac))
             new_flac = renamer.rename_file(str(flac))
             lrc_path = Path(new_flac).with_suffix(".lrc")
             if not lrc_path.exists():
@@ -449,7 +506,7 @@ def upgrade_album(
         except Exception as e:
             log.warning("Ошибка обработки трека %s: %s", flac.name, e)
 
-    # 3. Переименование папки альбома
+    # Шаг 4: Приведение имени папки к каноническому 'Artist - Album'
     new_folder_str = renamer.rename_album_folder(str(album_dir))
     new_folder = Path(new_folder_str)
 

@@ -4,7 +4,7 @@
 Позволяет одной командой привести всю существующую коллекцию к эталонному стандарту:
   1. Очистка от ID3-мусора и санитизация тегов (FLACSurgeon + TagSanitizer).
   2. Проверка и поиск недостающих качественных обложек (covers.musichoarders).
-  3. Поиск и сохранение караоке-текстов (.lrc) с LRCLIB и Genius.
+  3. Поиск и сохранение синхронизированных текстов (.lrc) с LRCLIB и Genius.
   4. Приведение треков к формату '01. Title.flac' и папок к 'Artist - Album'.
 
 Использование:
@@ -54,9 +54,9 @@ def main() -> None:
     if args.path:
         target_dir = Path(args.path)
     elif args.target == "inbox":
-        target_dir = Path(os.environ.get("NAVISAN_INBOX", "/home/arsen/Navisan/inbox"))
+        target_dir = Path(os.environ.get("NAVISAN_INBOX", "inbox"))
     else:
-        target_dir = Path(os.environ.get("NAVISAN_LIBRARY", "/home/arsen/Navisan/library"))
+        target_dir = Path(os.environ.get("NAVISAN_LIBRARY", "library"))
 
     if not target_dir.exists():
         print(f"❌ Целевой каталог не существует: {target_dir}")

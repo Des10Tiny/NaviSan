@@ -276,7 +276,7 @@ class LyricManager:
         if not overwrite and lrc_path.exists():
             try:
                 content = lrc_path.read_text(encoding="utf-8")
-                return "Караоке ✨" if has_timestamps(content) else "Текст 📄"
+                return "Синхронизированный 🎤" if has_timestamps(content) else "Обычный текст 📄"
             except Exception:
                 return "Уже есть 📁"
 
@@ -296,8 +296,8 @@ class LyricManager:
                 source_label = "LRCLIB" if res.source == "lrclib" else "Genius"
 
                 if res.is_synced:
-                    return f"Караоке [{source_label}] ✨"
-                return f"Текст [{source_label}] 📄"
+                    return f"Синхронизированный [{source_label}] 🎤"
+                return f"Обычный текст [{source_label}] 📄"
 
             return "Не найдено ❌"
         except Exception as e:
