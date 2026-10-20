@@ -94,7 +94,6 @@ INBOX: Path = Path(os.environ.get("NAVISAN_INBOX", "/inbox"))
 STAGING: Path = Path(os.environ.get("NAVISAN_STAGING", "/staging"))
 LIBRARY: Path = Path(os.environ.get("NAVISAN_LIBRARY", "/library"))
 DB_PATH: str = os.environ.get("NAVISAN_DB", "navidrome.db")
-ALIASES_PATH: str = os.environ.get("NAVISAN_ALIASES", "aliases.json")
 
 
 # ── Состояние сессии (State Machine) ──────────────────────────────────────────
@@ -488,7 +487,6 @@ def _run_full_pipeline(session: AlbumSession) -> tuple[list[str], Path]:
     pipeline_lines, staging_folder = apply_pipeline(
         staging_folder,
         db_path=DB_PATH,
-        aliases_path=ALIASES_PATH,
     )
     report.extend(pipeline_lines)
     session.staging_folder = staging_folder
@@ -895,7 +893,6 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                 None,
                 lambda: upgrade_library(
                     LIBRARY,
-                    aliases_path=ALIASES_PATH,
                     db_path=DB_PATH,
                     progress_callback=_on_progress,
                     cancel_flag=_is_cancelled,

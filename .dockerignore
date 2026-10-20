@@ -16,7 +16,7 @@ env/
 
 # Секреты и личные данные — НИКОГДА в образ
 .env
-aliases.json
+artists_cache.json
 navidrome.db
 unknown_artists.txt
 *.log

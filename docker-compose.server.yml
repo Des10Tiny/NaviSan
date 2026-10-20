@@ -4,10 +4,9 @@
 # 1. Склонируй/скопируй репозиторий NaviSan на сервер, например в /opt/media_stack/navisan/
 # 2. Добавь секцию ниже в /opt/media_stack/docker-compose.yml
 # 3. Создай /opt/media_stack/navisan/.env по образцу .env.example
-# 4. Создай /opt/media_stack/navisan/aliases.json по образцу aliases.example.json
-# 5. Создай папки: mkdir -p /opt/media_stack/{staging}
-# 6. chown -R 1000:1000 /opt/media_stack/staging
-# 7. docker compose up -d navisan
+# 4. Создай папки: mkdir -p /opt/media_stack/{staging}
+# 5. chown -R 1000:1000 /opt/media_stack/staging
+# 6. docker compose up -d navisan
 
 services:
   navisan:
@@ -25,8 +24,8 @@ services:
       - /opt/media_stack/music:/library:rw
       # База Navidrome — только для чтения (сверка канонических имён артистов)
       - /opt/media_stack/navidrome/navidrome.db:/data/navidrome.db:ro
-      # Личные данные — снаружи образа, в git не попадают
-      - /opt/media_stack/navisan/aliases.json:/app/aliases.json:rw
+      # Кеш артистов и конфигурация
+      - /opt/media_stack/navisan/artists_cache.json:/app/artists_cache.json:rw
       - /opt/media_stack/navisan/.env:/app/.env:ro
     environment:
       # Переменные окружения переопределяют значения из .env
@@ -35,5 +34,4 @@ services:
       - NAVISAN_STAGING=/staging
       - NAVISAN_LIBRARY=/library
       - NAVISAN_DB=/data/navidrome.db
-      - NAVISAN_ALIASES=/app/aliases.json
     # Нет открытых портов — бот работает только через Telegram Bot API (long polling)

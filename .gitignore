@@ -24,8 +24,7 @@ navidrome.db
 *.db-*
 *.sqlite
 *.sqlite3
-aliases.json
-!aliases.example.json
+artists_cache.json
 unknown_artists.txt
 *.log
 

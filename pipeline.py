@@ -135,8 +135,7 @@ def update_album_cover(folder: Path, cover: CoverCandidate) -> str:
 def apply_pipeline(
     folder: Path,
     *,
-    db_path: str,
-    aliases_path: str,
+    db_path: str = "navidrome.db",
 ) -> tuple[list[str], Path]:
     """Запускает полный pipeline обработки для всех FLAC в папке.
 
@@ -149,7 +148,7 @@ def apply_pipeline(
     Returns:
         Кортеж (список строк-отчёта, обновлённый путь к папке в Staging).
     """
-    sanitizer = TagSanitizer(aliases_path=aliases_path, db_path=db_path)
+    sanitizer = TagSanitizer(db_path=db_path)
     surgeon = FLACSurgeon(sanitizer=sanitizer)
     renamer = FileSystemManager()
     lyricist = LyricManager()
@@ -450,7 +449,6 @@ def album_has_cover(album_dir: Path) -> bool:
 
 def upgrade_album(
     album_dir: Path,
-    aliases_path: str | Path = "aliases.json",
     db_path: str | Path = "navidrome.db",
     force_cover: bool = False,
 ) -> dict:
@@ -465,7 +463,7 @@ def upgrade_album(
     if not flac_files:
         return {"error": "no_flacs", "folder": album_dir.name}
 
-    sanitizer = TagSanitizer(aliases_path=aliases_path, db_path=db_path)
+    sanitizer = TagSanitizer(db_path=db_path)
     surgeon = FLACSurgeon(sanitizer=sanitizer)
     renamer = FileSystemManager()
     lyricist = LyricManager()
@@ -522,7 +520,6 @@ def upgrade_album(
 
 def upgrade_library(
     library_dir: Path,
-    aliases_path: str | Path = "aliases.json",
     db_path: str | Path = "navidrome.db",
     progress_callback: Callable[[int, int, str, dict], None] | None = None,
     cancel_flag: Callable[[], bool] | None = None,
@@ -544,7 +541,7 @@ def upgrade_library(
             log.info("Идеализация библиотеки прервана пользователем")
             break
 
-        res = upgrade_album(album_folder, aliases_path=aliases_path, db_path=db_path)
+        res = upgrade_album(album_folder, db_path=db_path)
         processed += 1
         if res.get("cover_added"):
             total_covers += 1

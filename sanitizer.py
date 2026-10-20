@@ -1,8 +1,8 @@
-"""Нормализация имён артистов через таблицу алиасов и базу Navidrome (ADR-0005).
+"""Нормализация имён артистов через базу Navidrome и онлайн-каталоги (Deezer/iTunes).
 
-Разбивает составные строки исполнителей (feat, ft, x, and, запятые),
-приводит имена к каноническому виду по словарю aliases.json и сверяет
-их с существующей базой данных Navidrome (navidrome.db).
+Разбивает составные строки исполнителей (feat, ft, x, and, запятые), сверяет их с существующей
+базой данных Navidrome (navidrome.db) и осуществляет безопасную автокоррекцию регистра
+и спецсимволов через проверенные онлайн-каталоги (Deezer, iTunes) с локальным кешированием.
 """
 
 from __future__ import annotations
@@ -12,9 +12,47 @@ import logging
 import os
 import re
 import sqlite3
+from difflib import SequenceMatcher
 from pathlib import Path
 
+import httpx
+
 log = logging.getLogger(__name__)
+
+
+def is_safe_match(query: str, candidate: str) -> bool:
+    """Проверяет безопасность замены артиста через fuzzy matching.
+
+    Не допускает подмены на других артистов (например, Ghost -> Ghostface Killah),
+    но разрешает нормализацию регистра, спецсимволов ($ -> s, & -> and) и пунктуации.
+    """
+    def norm(s: str) -> str:
+        s = s.lower().replace("$", "s").replace("&", "and")
+        return re.sub(r"[^\w]", "", s)
+
+    nq = norm(query)
+    nc = norm(candidate)
+
+    if not nq or not nc:
+        return False
+
+    if nq == nc:
+        return True
+
+    return SequenceMatcher(None, nq, nc).ratio() >= 0.85
+
+
+def pick_best_candidate(query: str, candidates: list[str]) -> str | None:
+    """Выбирает лучшего кандидата: точное совпадение (без учёта регистра) имеет высший приоритет,
+    затем безопасное fuzzy/символьное совпадение."""
+    q_lower = query.strip().lower()
+    for cand in candidates:
+        if cand.strip().lower() == q_lower:
+            return cand.strip()
+    for cand in candidates:
+        if is_safe_match(query, cand):
+            return cand.strip()
+    return None
 
 
 class TagSanitizer:
@@ -22,43 +60,103 @@ class TagSanitizer:
 
     def __init__(
         self,
-        aliases_path: str | Path = "aliases.json",
         db_path: str | Path = "navidrome.db",
+        cache_path: str | Path = "artists_cache.json",
     ) -> None:
-        self.aliases_path = str(aliases_path)
         self.db_path = str(db_path)
+        self.cache_path = str(cache_path)
 
-        self.canonical_names_lower: set[str] = set()
-        self.aliases: dict[str, str] = self._load_aliases()
+        self.artists_cache: dict[str, str | None] = self._load_cache()
         self.unmapped_artists: set[str] = set()
         self.split_pattern = re.compile(
             r"(?i)\s+(?:feat\.?|ft\.?|x|and|и)\s+|\s*[,;&]\s*"
         )
 
-    def _load_aliases(self) -> dict[str, str]:
-        """Загружает словарь алиасов. Все ключи приводятся к нижнему регистру."""
-        if not os.path.exists(self.aliases_path):
-            with open(self.aliases_path, "w", encoding="utf-8") as f:
-                json.dump({}, f)
+    def _load_cache(self) -> dict[str, str | None]:
+        """Загружает локальный кеш онлайн-проверок имён артистов."""
+        if not os.path.exists(self.cache_path):
             return {}
-
         try:
-            with open(self.aliases_path, "r", encoding="utf-8") as f:
-                raw_aliases = json.load(f)
-
-            aliases = {k.lower(): str(v) for k, v in raw_aliases.items()}
-            self.canonical_names_lower = {v.lower() for v in aliases.values()}
-            return aliases
+            with open(self.cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {k.lower(): (str(v) if v is not None else None) for k, v in data.items()}
         except (json.JSONDecodeError, OSError) as e:
-            log.warning("Ошибка чтения файла алиасов %s: %s", self.aliases_path, e)
+            log.warning("Ошибка чтения кеша артистов %s: %s", self.cache_path, e)
             return {}
 
-    def save_alias(self, wrong_name: str, correct_name: str) -> None:
-        """Сохраняет новый алиас в файл."""
-        self.aliases[wrong_name.lower()] = correct_name
-        self.canonical_names_lower.add(correct_name.lower())
-        with open(self.aliases_path, "w", encoding="utf-8") as f:
-            json.dump(self.aliases, f, ensure_ascii=False, indent=4)
+    def _save_cache_entry(self, wrong_name: str, canonical_name: str | None) -> None:
+        """Сохраняет результат проверки артиста в локальный кеш."""
+        self.artists_cache[wrong_name.lower()] = canonical_name
+        try:
+            with open(self.cache_path, "w", encoding="utf-8") as f:
+                json.dump(self.artists_cache, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            log.warning("Ошибка сохранения кеша артистов %s: %s", self.cache_path, e)
+
+    def _fetch_online_canonical(self, artist_name: str) -> str | None:
+        """Ищет каноническое написание артиста в проверенных каталогах (Deezer, iTunes, Genius)."""
+        name_clean = artist_name.strip()
+        if not name_clean:
+            return None
+
+        # 1. Deezer API (официальный каталог лейблов, быстрый и точный)
+        try:
+            r = httpx.get(
+                "https://api.deezer.com/search/artist",
+                params={"q": name_clean},
+                timeout=4.0,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                cands = [item["name"] for item in data[:5] if item.get("name")]
+                best = pick_best_candidate(name_clean, cands)
+                if best:
+                    return best
+        except Exception as e:
+            log.debug("Deezer lookup failed for '%s': %s", name_clean, e)
+
+        # 2. iTunes Search API (надёжный fallback без ключей с отличной поддержкой кириллицы)
+        try:
+            r = httpx.get(
+                "https://itunes.apple.com/search",
+                params={"term": name_clean, "entity": "musicArtist", "limit": "5"},
+                timeout=4.0,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code == 200:
+                results = r.json().get("results", [])
+                cands = [item["artistName"] for item in results[:5] if item.get("artistName")]
+                best = pick_best_candidate(name_clean, cands)
+                if best:
+                    return best
+        except Exception as e:
+            log.debug("iTunes lookup failed for '%s': %s", name_clean, e)
+
+        # 3. Genius API (если задан токен в переменных окружения)
+        token = os.getenv("GENIUS_ACCESS_TOKEN") or os.getenv("GENIUS_TOKEN")
+        if token:
+            try:
+                r = httpx.get(
+                    "https://api.genius.com/search",
+                    params={"q": name_clean},
+                    headers={"Authorization": f"Bearer {token}", "User-Agent": "Navisan/1.0"},
+                    timeout=4.0,
+                )
+                if r.status_code == 200:
+                    hits = r.json().get("response", {}).get("hits", [])
+                    cands = [
+                        hit.get("result", {}).get("primary_artist", {}).get("name")
+                        for hit in hits[:5]
+                        if hit.get("result", {}).get("primary_artist", {}).get("name")
+                    ]
+                    best = pick_best_candidate(name_clean, cands)
+                    if best:
+                        return best
+            except Exception as e:
+                log.debug("Genius lookup failed for '%s': %s", name_clean, e)
+
+        return None
 
     def _get_artist_from_db(self, artist_name: str) -> str | None:
         """Проверяет наличие артиста в базе данных Navidrome (регистронезависимо)."""
@@ -105,22 +203,16 @@ class TagSanitizer:
         if not raw_str:
             return []
 
-        # 1. Быстрая проверка: полное совпадение со словарём алиасов или базой Navidrome
+        # 1. Быстрая проверка: полное совпадение с кешем или базой Navidrome
         raw_lower = raw_str.lower()
-        if raw_lower in self.aliases:
-            return [self.aliases[raw_lower]]
+        if raw_lower in self.artists_cache and self.artists_cache[raw_lower]:
+            return [self.artists_cache[raw_lower]]
         db_match = self._get_artist_from_db(raw_str)
-        if db_match:
+        if db_match and not db_match.islower() and not (db_match.isupper() and len(db_match) > 3):
             return [db_match]
 
-        # 2. Формируем список составных артистов только из aliases.json и navidrome.db
-        protected = set()
-        for k, v in self.aliases.items():
-            if any(c in k for c in (",", ";", "&")) or " and " in k.lower():
-                protected.add(k.lower())
-            if any(c in v for c in (",", ";", "&")) or " and " in v.lower():
-                protected.add(v.lower())
-        protected.update(self._get_compound_artists_from_db())
+        # 2. Формируем список составных артистов из navidrome.db
+        protected = self._get_compound_artists_from_db()
 
         # 3. Экранирование защищённых групп токенами перед сплитом
         sorted_prot = sorted(protected, key=len, reverse=True)
@@ -151,21 +243,30 @@ class TagSanitizer:
 
             artist_lower = artist.lower()
 
-            if artist_lower in self.aliases:
-                canonical = self.aliases[artist_lower]
-            elif artist_lower in self.canonical_names_lower:
-                canonical = artist
+            # 1. Приоритет: результат из локального кеша онлайн-проверок
+            if artist_lower in self.artists_cache:
+                cached = self.artists_cache[artist_lower]
+                final_artist = cached if cached else artist
             else:
-                canonical = artist
-                self.unmapped_artists.add(artist)
-
-            # Сверяем с базой Navidrome
-            db_artist = self._get_artist_from_db(canonical)
-            if db_artist:
-                final_artist = db_artist
-                self.unmapped_artists.discard(artist)
-            else:
-                final_artist = canonical
+                # 2. Проверка локальной базы Navidrome
+                db_artist = self._get_artist_from_db(artist)
+                if db_artist and not db_artist.islower() and not (db_artist.isupper() and len(db_artist) > 3):
+                    final_artist = db_artist
+                else:
+                    # 3. Онлайн-каноникализация через Deezer / iTunes с проверкой безопасности
+                    online_name = self._fetch_online_canonical(artist)
+                    if online_name:
+                        self._save_cache_entry(artist_lower, online_name)
+                        final_artist = online_name
+                        log.info("Онлайн-нормализация артиста: '%s' -> '%s'", artist, online_name)
+                    elif db_artist:
+                        self._save_cache_entry(artist_lower, db_artist)
+                        final_artist = db_artist
+                    else:
+                        # Записываем None в кеш, чтобы не повторять сетевой запрос
+                        self._save_cache_entry(artist_lower, None)
+                        final_artist = artist
+                        self.unmapped_artists.add(artist)
 
             clean_artists.append(final_artist)
 

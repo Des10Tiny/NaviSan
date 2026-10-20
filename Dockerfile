@@ -35,7 +35,7 @@ COPY *.py ./
 # Переключаемся на непривилегированного пользователя
 USER navisan
 
-# .env и aliases.json монтируются снаружи как volumes — не копируем их в образ
+# .env и artists_cache.json монтируются снаружи как volumes — не копируем их в образ
 # Точки монтирования описаны в docker-compose.yml
 
 CMD ["python", "bot.py"]
