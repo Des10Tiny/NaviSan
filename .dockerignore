@@ -1,0 +1,42 @@
+# Файлы, которые НЕ попадают в docker build context.
+# Уменьшает размер контекста и исключает случайное копирование секретов в образ.
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Среда разработки
+venv/
+.venv/
+env/
+
+# Секреты и личные данные — НИКОГДА в образ
+.env
+aliases.json
+navidrome.db
+unknown_artists.txt
+*.log
+
+# Медиафайлы и тестовые данные
+test_music/
+inbox/
+staging/
+library/
+*.flac
+*.lrc
+cover.jpg
+
+# Артефакты разработки
+.git/
+.scratch/
+.gemini/
+.claude/
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

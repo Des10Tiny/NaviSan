@@ -169,8 +169,40 @@ def search_covers(
     finally:
         resp.close()
 
-    log.info("Найдено %d кандидатов (из %d уникальных URL)", len(candidates), len(seen_urls))
-    return candidates
+    ordered = reorder_candidates_round_robin(candidates, sources)
+    log.info("Найдено %d кандидатов (упорядочены round-robin)", len(ordered))
+    return ordered
+
+
+def reorder_candidates_round_robin(
+    candidates: list[CoverCandidate],
+    sources: tuple[str, ...],
+) -> list[CoverCandidate]:
+    """Упорядочивает кандидатов методом Round-Robin по источникам.
+
+    Сначала идут первые (лучшие) обложки от каждого доступного источника,
+    затем вторые, и т.д. Если один сервис вернул меньше обложек, слоты
+    следующих раундов заполняются оставшимися кандидатами от других сервисов.
+    """
+    by_source: dict[str, list[CoverCandidate]] = {s: [] for s in sources}
+    other: list[CoverCandidate] = []
+
+    for c in candidates:
+        if c.source in by_source:
+            by_source[c.source].append(c)
+        else:
+            other.append(c)
+
+    ordered: list[CoverCandidate] = []
+    max_len = max([len(v) for v in by_source.values()] + [0])
+
+    for round_idx in range(max_len):
+        for s in sources:
+            if round_idx < len(by_source[s]):
+                ordered.append(by_source[s][round_idx])
+
+    ordered.extend(other)
+    return ordered
 
 
 # ── Скачивание ───────────────────────────────────────────────────────────────

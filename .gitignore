@@ -21,6 +21,7 @@ ENV/
 # Local databases and runtime data
 navidrome.db
 *.db
+*.db-*
 *.sqlite
 *.sqlite3
 aliases.json
