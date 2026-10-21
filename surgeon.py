@@ -36,8 +36,8 @@ class FLACSurgeon:
         "replaygain_reference_loudness",
     })
 
-    def __init__(self, sanitizer: TagSanitizer) -> None:
-        self.sanitizer = sanitizer
+    def __init__(self, sanitizer: TagSanitizer | None = None) -> None:
+        self.sanitizer = sanitizer if sanitizer is not None else TagSanitizer()
 
     def _embed_cover_from_file(
         self,

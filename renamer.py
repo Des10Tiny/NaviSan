@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 from collections import Counter
 from pathlib import Path
 
@@ -144,11 +145,143 @@ class FileSystemManager:
             log.info("Папка переименована (регистр): %s", new_dirname)
             return str(new_folder)
 
-        # Если целевая папка уже существует — не затираем её
+        # Если целевая папка уже существует — объединяем с ней содержимое
         if new_folder.exists():
-            log.warning("Папка с именем '%s' уже существует рядом. Пропускаю переименование.", new_dirname)
-            return str(folder_path)
+            log.info("Папка с именем '%s' уже существует рядом. Объединяю содержимое.", new_dirname)
+            self.merge_folders(folder, new_folder)
+            return str(new_folder)
 
         folder.rename(new_folder)
         log.info("Папка переименована: %s", new_dirname)
         return str(new_folder)
+
+    def merge_folders(
+        self,
+        src_folder: str | Path,
+        dst_folder: str | Path,
+        has_chosen_cover: bool = False,
+    ) -> dict:
+        """Объединяет файлы из src_folder в dst_folder без создания дубликатов (2).
+
+        - Переносит новые треки и метаданные.
+        - Заменяет существующие FLAC обновлёнными версиями.
+        - Не даунгрейдит синхронизированные тексты (.lrc).
+        - Вшивает обложку альбома в добавленные треки (если у них нет обложки).
+        - Пересчитывает ReplayGain для объединённого релиза.
+        - Удаляет исходную папку src_folder.
+
+        Returns:
+            Словарь со статистикой слияния:
+            {"added_tracks": [...], "updated_tracks": [...], "total_flacs": int, "rg_ok": bool, "rg_msg": str}
+        """
+        src = Path(src_folder)
+        dst = Path(dst_folder)
+        dst.mkdir(parents=True, exist_ok=True)
+
+        added_tracks: list[Path] = []
+        updated_tracks: list[Path] = []
+
+        # 1. Рекурсивный перенос файлов
+        for root, dirs, files in os.walk(src):
+            rel_dir = Path(root).relative_to(src)
+            target_dir = dst / rel_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            for fname in files:
+                src_file = Path(root) / fname
+                dst_file = target_dir / fname
+                ext = src_file.suffix.lower()
+
+                if ext == ".flac":
+                    if dst_file.exists():
+                        try:
+                            dst_file.unlink(missing_ok=True)
+                        except Exception as e:
+                            log.warning("Не удалось удалить существующий файл %s: %s", dst_file.name, e)
+                        shutil.move(str(src_file), str(dst_file))
+                        updated_tracks.append(dst_file)
+                    else:
+                        shutil.move(str(src_file), str(dst_file))
+                        added_tracks.append(dst_file)
+
+                elif ext == ".lrc":
+                    if dst_file.exists():
+                        try:
+                            dst_txt = dst_file.read_text(encoding="utf-8", errors="replace")
+                            src_txt = src_file.read_text(encoding="utf-8", errors="replace")
+                            # Не даунгрейдим синхронизированный текст в обычный
+                            dst_has_ts = bool(re.search(r"\[\d{2}:\d{2}", dst_txt))
+                            src_has_ts = bool(re.search(r"\[\d{2}:\d{2}", src_txt))
+                            if dst_has_ts and not src_has_ts:
+                                src_file.unlink(missing_ok=True)
+                            else:
+                                dst_file.unlink(missing_ok=True)
+                                shutil.move(str(src_file), str(dst_file))
+                        except Exception:
+                            dst_file.unlink(missing_ok=True)
+                            shutil.move(str(src_file), str(dst_file))
+                    else:
+                        shutil.move(str(src_file), str(dst_file))
+
+                elif fname.lower() in ("cover.jpg", "cover.jpeg", "cover.png", "folder.jpg"):
+                    if dst_file.exists():
+                        if has_chosen_cover:
+                            dst_file.unlink(missing_ok=True)
+                            shutil.move(str(src_file), str(dst_file))
+                        else:
+                            src_file.unlink(missing_ok=True)
+                    else:
+                        shutil.move(str(src_file), str(dst_file))
+
+                else:
+                    if not dst_file.exists():
+                        shutil.move(str(src_file), str(dst_file))
+                    else:
+                        src_file.unlink(missing_ok=True)
+
+        # 2. Удаляем исходную папку
+        shutil.rmtree(src, ignore_errors=True)
+
+        # 3. Синхронизируем обложку альбома в добавленные треки
+        dst_cover = None
+        for cname in ("cover.jpg", "cover.jpeg", "cover.png", "folder.jpg"):
+            cp = dst / cname
+            if cp.exists() and cp.stat().st_size > 0:
+                dst_cover = cp
+                break
+
+        if dst_cover:
+            try:
+                from surgeon import FLACSurgeon
+                surgeon = FLACSurgeon()
+                target_list = list(dst.rglob("*.flac")) if has_chosen_cover else added_tracks
+                for tr in target_list:
+                    if tr.exists():
+                        try:
+                            audio = FLAC(str(tr))
+                            if not audio.pictures or has_chosen_cover:
+                                surgeon.heal_file(str(tr), force_update=has_chosen_cover)
+                        except Exception as e:
+                            log.debug("Не удалось синхронизировать обложку в %s: %s", tr.name, e)
+            except Exception as e:
+                log.warning("Ошибка при вшивании обложки после слияния: %s", e)
+
+        # 4. Пересчёт ReplayGain для объединённого релиза
+        rg_ok = False
+        rg_msg = ""
+        try:
+            from replaygain import apply_replaygain
+            rg_ok, rg_msg = apply_replaygain(dst)
+        except Exception as e:
+            log.warning("Ошибка расчёта ReplayGain после слияния: %s", e)
+
+        total_flacs = len(list(dst.rglob("*.flac")))
+
+        return {
+            "dest": dst,
+            "added_tracks": [t.name for t in added_tracks],
+            "updated_tracks": [t.name for t in updated_tracks],
+            "total_flacs": total_flacs,
+            "rg_ok": rg_ok,
+            "rg_msg": rg_msg,
+        }

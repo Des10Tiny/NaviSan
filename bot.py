@@ -50,6 +50,7 @@ from pipeline import (
     cleanup_inbox,
     copy_to_staging,
     count_flacs,
+    find_existing_library_album,
     move_to_library,
     update_album_cover,
     get_album_artists_info,
@@ -241,13 +242,21 @@ async def _on_new_release(folder: Path, app: Application, is_recover: bool = Fal
 
     log.info("Релиз для обработки: %s — %s (is_recover=%s)", artist, album, is_recover)
 
+    existing_note = ""
+    if not is_recover and LIBRARY.exists() and artist and album:
+        from renamer import FileSystemManager
+        probe_folder = folder.parent / FileSystemManager().clean_name(f"{artist} - {album}")
+        existing_dest = find_existing_library_album(probe_folder, LIBRARY)
+        if existing_dest:
+            existing_note = f"\nℹ️ *Альбом уже есть в библиотеке:* `{existing_dest.name}`\n_Новые треки будут объединены с ним без создания дубликатов._\n"
+
     header = f"🖼️ *Смена обложки в {LIBRARY.name}*" if is_recover else f"📥 *Новый релиз в {INBOX.name}*"
     status_msg = await app.bot.send_message(
         chat_id=OWNER_ID,
         text=(
             f"{header}\n\n"
             f"🎵 {artist} — {album}\n"
-            f"📂 `{folder.name}` ({n_tracks} треков)\n\n"
+            f"📂 `{folder.name}` ({n_tracks} треков){existing_note}\n\n"
             f"🔍 Ищу обложки на стримингах…"
         ),
         parse_mode="Markdown",
@@ -287,7 +296,7 @@ async def _on_new_release(folder: Path, app: Application, is_recover: bool = Fal
             text=f"⚙️ *Автоматическая обработка релиза ({cover_info}):*\n🎵 {artist} — {album}",
             parse_mode="Markdown",
         )
-        await _execute_pipeline_and_report(proc_msg, app.bot, session)
+        await _execute_pipeline_and_report(proc_msg, app, session)
         return
 
     if candidates:
@@ -416,9 +425,13 @@ async def on_cover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await _execute_pipeline_and_report(status_msg, ctx, session)
 
 
-async def _execute_pipeline_and_report(status_msg, ctx_or_bot, session: AlbumSession) -> None:
+async def _execute_pipeline_and_report(status_msg, ctx_or_app, session: AlbumSession) -> None:
     """Выполняет пайплайн и заменяет статусное сообщение на финальный аккуратный отчёт."""
-    bot = ctx_or_bot.bot if hasattr(ctx_or_bot, "bot") else ctx_or_bot
+    bot = ctx_or_app.bot if hasattr(ctx_or_app, "bot") else ctx_or_app
+    bot_data = getattr(ctx_or_app, "bot_data", None)
+    if bot_data is None and hasattr(ctx_or_app, "application"):
+        bot_data = ctx_or_app.application.bot_data
+
     loop = asyncio.get_running_loop()
     try:
         report_lines, library_folder = await loop.run_in_executor(
@@ -443,7 +456,12 @@ async def _execute_pipeline_and_report(status_msg, ctx_or_bot, session: AlbumSes
     artist, album = album_info(library_folder)
     header_artist = f"💿 *{artist} — {album}*\n👤 *Исполнитель релиза:* `{artist}`\n\n" if (artist and album) else ""
     report = "\n".join(report_lines)
-    final_text = f"✅ *Альбом добавлен в библиотеку!*\n\n{header_artist}{report}"
+    is_merged = any("Объединено с альбомом" in line for line in report_lines)
+    status_title = "Альбом обновлён в библиотеке (добавлены треки)!" if is_merged else "Альбом добавлен в библиотеку!"
+    final_text = f"✅ *{status_title}*\n\n{header_artist}{report}"
+
+    if bot_data is not None:
+        bot_data[f"release_report_{library_folder.name}"] = final_text
 
     keyboard = [
         [
@@ -473,16 +491,53 @@ async def _execute_pipeline_and_report(status_msg, ctx_or_bot, session: AlbumSes
 
 
 async def on_report_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик закрытия финального отчёта."""
+    """Обработчик действий финального отчёта релиза."""
     query = update.callback_query
     await query.answer()
     if update.effective_user.id != OWNER_ID:
         return
+
     if query.data == "report:close":
         try:
             await query.delete_message()
         except Exception:
             pass
+        return
+
+    if query.data.startswith("report:show:"):
+        album_name = query.data[len("report:show:"):]
+        album_dir = LIBRARY / album_name
+        if not album_dir.exists():
+            matches = [d for d in LIBRARY.iterdir() if d.is_dir() and album_name.lower() in d.name.lower()]
+            if matches:
+                album_dir = matches[0]
+                album_name = album_dir.name
+
+        report_text = ctx.bot_data.get(f"release_report_{album_name}")
+        if not report_text:
+            artist, album = album_info(album_dir) if album_dir.exists() else ("", "")
+            header = f"💿 *{artist} — {album}*\n👤 *Исполнитель релиза:* `{artist}`\n\n" if (artist and album) else ""
+            report_text = f"✅ *Альбом в библиотеке!*\n\n{header}📂 `{album_name}`"
+        else:
+            if album_dir.exists():
+                curr_artist, curr_album = album_info(album_dir)
+                if curr_artist and curr_album:
+                    new_header = f"💿 *{curr_artist} — {curr_album}*\n👤 *Исполнитель релиза:* `{curr_artist}`"
+                    import re
+                    report_text = re.sub(r"💿 \*.*?\*\n👤 \*Исполнитель релиза:\* `.*?`", new_header, report_text)
+                    ctx.bot_data[f"release_report_{album_name}"] = report_text
+
+        keyboard = [
+            [
+                InlineKeyboardButton("📝 Настроить тексты", callback_data=f"lyrics:album:{album_name}"),
+                InlineKeyboardButton("👤 Настроить артистов", callback_data=f"artist:album:{album_name}"),
+            ],
+            [
+                InlineKeyboardButton("❌ Закрыть", callback_data="report:close"),
+            ],
+        ]
+        await _safe_edit_message(query, report_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
 
 
 
@@ -507,9 +562,27 @@ def _run_full_pipeline(session: AlbumSession) -> tuple[list[str], Path]:
     report.extend(pipeline_lines)
     session.staging_folder = staging_folder
 
-    # 4. Переносим в Library
-    library_folder = move_to_library(staging_folder, LIBRARY)
-    report.append(f"📦 Перенесено в: `{library_folder.name}`")
+    # 4. Переносим в Library (со слиянием при наличии альбома)
+    library_folder, merge_info = move_to_library(
+        staging_folder,
+        LIBRARY,
+        has_chosen_cover=(session.chosen_cover is not None),
+    )
+    if merge_info.get("merged"):
+        added_count = len(merge_info.get("added_tracks", []))
+        updated_count = len(merge_info.get("updated_tracks", []))
+        details = []
+        if added_count:
+            details.append(f"добавлено: {added_count}")
+        if updated_count:
+            details.append(f"обновлено: {updated_count}")
+        details_str = f" ({', '.join(details)})" if details else ""
+        report.append(f"📦 Объединено с альбомом в библиотеке: `{library_folder.name}`{details_str}")
+        report.append(f"💿 Всего треков в альбоме теперь: *{merge_info.get('total_flacs', 0)}*")
+        if merge_info.get("rg_ok"):
+            report.append("🔊 ReplayGain: обновлён для всего альбома")
+    else:
+        report.append(f"📦 Перенесено в: `{library_folder.name}`")
 
     # 5. Чистим Inbox
     cleanup_inbox(session.folder)
@@ -949,7 +1022,9 @@ async def _safe_edit_message(query, text: str, reply_markup=None, parse_mode="Ma
 
 # ── Настройка текстов песен (Lyrics UI) ───────────────────────────────────────
 
-def _render_album_lyrics_tracklist(album_dir: Path, tracks: list[Path]) -> tuple[str, list[list[InlineKeyboardButton]]]:
+def _render_album_lyrics_tracklist(
+    album_dir: Path, tracks: list[Path], from_report: bool = False
+) -> tuple[str, list[list[InlineKeyboardButton]]]:
     """Формирует список треков альбома со статусами текстов и кнопками выбора."""
     artist, album = album_info(album_dir)
     title_str = f"{artist} — {album}" if album else album_dir.name
@@ -997,15 +1072,22 @@ def _render_album_lyrics_tracklist(album_dir: Path, tracks: list[Path]) -> tuple
     if batch_row:
         keyboard.append(batch_row)
 
-    keyboard.append([
-        InlineKeyboardButton("📁 К альбомам", callback_data="lyrics:alb_list"),
-        InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close"),
-    ])
+    if from_report:
+        keyboard.append([
+            InlineKeyboardButton("⬅️ Назад к релизу", callback_data=f"report:show:{album_dir.name}")
+        ])
+    else:
+        keyboard.append([
+            InlineKeyboardButton("📁 К альбомам", callback_data="lyrics:alb_list"),
+            InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close"),
+        ])
 
     return "\n".join(lines), keyboard
 
 
-def _render_track_lyrics_card(track_path: Path, track_idx: int) -> tuple[str, list[list[InlineKeyboardButton]]]:
+def _render_track_lyrics_card(
+    track_path: Path, track_idx: int, from_report: bool = False
+) -> tuple[str, list[list[InlineKeyboardButton]]]:
     """Формирует карточку трека с превью текста и кнопками смены источника."""
     rg_str = ""
     try:
@@ -1050,6 +1132,10 @@ def _render_track_lyrics_card(track_path: Path, track_idx: int) -> tuple[str, li
         InlineKeyboardButton("✏️ Свой текст", callback_data=f"lyrics:man:{track_idx}"),
     ]
 
+    bottom_row = [InlineKeyboardButton("⬅️ К списку треков", callback_data="lyrics:back")]
+    if not from_report:
+        bottom_row.append(InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close"))
+
     keyboard = [
         [
             InlineKeyboardButton("🔍 LRCLIB", callback_data=f"lyrics:src:lrclib:{track_idx}"),
@@ -1060,10 +1146,7 @@ def _render_track_lyrics_card(track_path: Path, track_idx: int) -> tuple[str, li
             InlineKeyboardButton("🔍 SyncedLyrics", callback_data=f"lyrics:src:syncedlyrics:{track_idx}"),
         ],
         action_row,
-        [
-            InlineKeyboardButton("⬅️ К списку треков", callback_data="lyrics:back"),
-            InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close"),
-        ],
+        bottom_row,
     ]
     return text, keyboard
 
@@ -1186,12 +1269,14 @@ async def cmd_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         tracks = sorted(album_dir.rglob("*.flac"))
         ctx.bot_data["lyrics_tracks"] = tracks
         ctx.bot_data["lyrics_album_path"] = album_dir
-        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks)
+        ctx.bot_data.pop("lyrics_from_report", None)
+        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks, from_report=False)
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     ctx.bot_data["lyrics_albums"] = matches
     ctx.bot_data["lyrics_cmd_msg_id"] = update.message.message_id
+    ctx.bot_data.pop("lyrics_from_report", None)
     text, keyboard = _render_albums_menu(matches)
     await update.message.reply_text(
         text,
@@ -1202,7 +1287,30 @@ async def cmd_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Настройка артистов (Artist UI) ───────────────────────────────────────────
 
-def _render_album_artists_view(album_dir: Path) -> tuple[str, list[list[InlineKeyboardButton]]]:
+def _update_album_references(ctx: ContextTypes.DEFAULT_TYPE, old_folder: Path, new_folder: Path) -> None:
+    """Обновляет ссылки и кэши в bot_data при переименовании папки альбома."""
+    if old_folder == new_folder:
+        return
+    ctx.bot_data["artist_album_path"] = new_folder
+    ctx.bot_data["artist_tracks"] = sorted(new_folder.rglob("*.flac"))
+    if "lyrics_albums" in ctx.bot_data:
+        ctx.bot_data["lyrics_albums"] = [
+            new_folder if d == old_folder else d for d in ctx.bot_data["lyrics_albums"]
+        ]
+    if ctx.bot_data.get("lyrics_album_path") == old_folder:
+        ctx.bot_data["lyrics_album_path"] = new_folder
+        ctx.bot_data["lyrics_tracks"] = sorted(new_folder.rglob("*.flac"))
+    if ctx.bot_data.get("lyrics_from_report") == old_folder.name:
+        ctx.bot_data["lyrics_from_report"] = new_folder.name
+    if ctx.bot_data.get("artist_from_report") == old_folder.name:
+        ctx.bot_data["artist_from_report"] = new_folder.name
+    if f"release_report_{old_folder.name}" in ctx.bot_data:
+        ctx.bot_data[f"release_report_{new_folder.name}"] = ctx.bot_data.pop(f"release_report_{old_folder.name}")
+
+
+def _render_album_artists_view(
+    album_dir: Path, from_report: bool = False
+) -> tuple[str, list[list[InlineKeyboardButton]]]:
     """Формирует обзор артистов альбома и кнопки выбора треков."""
     info = get_album_artists_info(album_dir)
     album_display = info["album"] or album_dir.name
@@ -1232,11 +1340,16 @@ def _render_album_artists_view(album_dir: Path) -> tuple[str, list[list[InlineKe
     for row_start in range(0, len(buttons), 5):
         keyboard.append(buttons[row_start : row_start + 5])
 
-    keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="artist:close")])
+    if from_report:
+        keyboard.append([InlineKeyboardButton("⬅️ Назад к релизу", callback_data=f"report:show:{album_dir.name}")])
+    else:
+        keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="artist:close")])
     return "\n".join(lines), keyboard
 
 
-def _render_album_artists_all_prompt(album_dir: Path) -> tuple[str, list[list[InlineKeyboardButton]]]:
+def _render_album_artists_all_prompt(
+    album_dir: Path, from_report: bool = False
+) -> tuple[str, list[list[InlineKeyboardButton]]]:
     """Формирует карточку ожидания ввода нового единого исполнителя для всех треков релиза."""
     info = get_album_artists_info(album_dir)
     album_display = info["album"] or album_dir.name
@@ -1251,14 +1364,16 @@ def _render_album_artists_all_prompt(album_dir: Path) -> tuple[str, list[list[In
         "_Имя будет записано во все треки альбома, в тег ALBUMARTIST и обновит имя папки релиза._\n",
         "Для отмены нажми кнопку ниже или отправь /cancel.",
     ]
-    keyboard = [
-        [InlineKeyboardButton("⬅️ Назад к альбому", callback_data="artist:alb_back")],
-        [InlineKeyboardButton("❌ Закрыть", callback_data="artist:close")],
-    ]
+    back_row = [InlineKeyboardButton("⬅️ Назад к альбому", callback_data="artist:alb_back")]
+    if not from_report:
+        back_row.append(InlineKeyboardButton("❌ Закрыть", callback_data="artist:close"))
+    keyboard = [back_row]
     return "\n".join(lines), keyboard
 
 
-def _render_album_artist_edit_card(album_dir: Path, suggestions: list[str]) -> tuple[str, list[list[InlineKeyboardButton]]]:
+def _render_album_artist_edit_card(
+    album_dir: Path, suggestions: list[str], from_report: bool = False
+) -> tuple[str, list[list[InlineKeyboardButton]]]:
     """Формирует карточку редактирования ALBUMARTIST с динамическими подсказками из треков."""
     info = get_album_artists_info(album_dir)
     album_display = info["album"] or album_dir.name
@@ -1287,15 +1402,18 @@ def _render_album_artist_edit_card(album_dir: Path, suggestions: list[str]) -> t
     keyboard.append([
         InlineKeyboardButton("🗑️ Очистить ALBUMARTIST (удалить тег)", callback_data="artist:setaa:clear")
     ])
-    keyboard.append([
-        InlineKeyboardButton("⬅️ Назад к альбому", callback_data="artist:alb_back"),
-        InlineKeyboardButton("❌ Закрыть", callback_data="artist:close"),
-    ])
+
+    back_row = [InlineKeyboardButton("⬅️ Назад к альбому", callback_data="artist:alb_back")]
+    if not from_report:
+        back_row.append(InlineKeyboardButton("❌ Закрыть", callback_data="artist:close"))
+    keyboard.append(back_row)
 
     return "\n".join(lines), keyboard
 
 
-def _render_album_artist_custom_prompt(album_dir: Path) -> tuple[str, list[list[InlineKeyboardButton]]]:
+def _render_album_artist_custom_prompt(
+    album_dir: Path, from_report: bool = False
+) -> tuple[str, list[list[InlineKeyboardButton]]]:
     """Формирует карточку ожидания ручного ввода ALBUMARTIST."""
     info = get_album_artists_info(album_dir)
     album_display = info["album"] or album_dir.name
@@ -1311,14 +1429,16 @@ def _render_album_artist_custom_prompt(album_dir: Path) -> tuple[str, list[list[
         f"Отправь новое значение ALBUMARTIST ответным сообщением в чат{example_hint}.\n",
         "_Для отмены нажми кнопку ниже или отправь /cancel._",
     ]
-    keyboard = [
-        [InlineKeyboardButton("⬅️ Назад к вариантам", callback_data="artist:editaa")],
-        [InlineKeyboardButton("❌ Закрыть", callback_data="artist:close")],
-    ]
+    back_row = [InlineKeyboardButton("⬅️ Назад к вариантам", callback_data="artist:editaa")]
+    if not from_report:
+        back_row.append(InlineKeyboardButton("❌ Закрыть", callback_data="artist:close"))
+    keyboard = [back_row]
     return "\n".join(lines), keyboard
 
 
-def _render_track_artist_card(track_path: Path, track_idx: int) -> tuple[str, list[list[InlineKeyboardButton]], list[str]]:
+def _render_track_artist_card(
+    track_path: Path, track_idx: int, from_report: bool = False
+) -> tuple[str, list[list[InlineKeyboardButton]], list[str]]:
     """Формирует карточку трека со списком артистов и кнопками управления."""
     try:
         audio = FLAC(str(track_path))
@@ -1374,10 +1494,11 @@ def _render_track_artist_card(track_path: Path, track_idx: int) -> tuple[str, li
         InlineKeyboardButton("✍️ Задать артистов трека вручную", callback_data=f"artist:settr:{track_idx}"),
         InlineKeyboardButton("➕ Добавить имя", callback_data=f"artist:add:{track_idx}"),
     ])
-    keyboard.append([
-        InlineKeyboardButton("⬅️ К альбому", callback_data="artist:alb_back"),
-        InlineKeyboardButton("❌ Закрыть", callback_data="artist:close"),
-    ])
+
+    back_row = [InlineKeyboardButton("⬅️ К альбому", callback_data="artist:alb_back")]
+    if not from_report:
+        back_row.append(InlineKeyboardButton("❌ Закрыть", callback_data="artist:close"))
+    keyboard.append(back_row)
 
     return "\n".join(lines), keyboard, other_artists
 
@@ -1423,7 +1544,8 @@ async def cmd_artist(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         album_dir = matches[0]
         ctx.bot_data["artist_tracks"] = sorted(album_dir.rglob("*.flac"))
         ctx.bot_data["artist_album_path"] = album_dir
-        text, keyboard = _render_album_artists_view(album_dir)
+        ctx.bot_data.pop("artist_from_report", None)
+        text, keyboard = _render_album_artists_view(album_dir, from_report=False)
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1437,6 +1559,7 @@ async def cmd_artist(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     ctx.bot_data["artist_albums"] = matches
     ctx.bot_data["artist_cmd_msg_id"] = update.message.message_id
+    ctx.bot_data.pop("artist_from_report", None)
     keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
     keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="artist:close")])
 
@@ -1493,8 +1616,9 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
         ctx.bot_data["artist_tracks"] = tracks
         ctx.bot_data["artist_album_path"] = album_dir
+        ctx.bot_data["artist_from_report"] = album_dir.name
 
-        text, keyboard = _render_album_artists_view(album_dir)
+        text, keyboard = _render_album_artists_view(album_dir, from_report=True)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1516,8 +1640,9 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         tracks = sorted(album_dir.rglob("*.flac"))
         ctx.bot_data["artist_tracks"] = tracks
         ctx.bot_data["artist_album_path"] = album_dir
+        ctx.bot_data.pop("artist_from_report", None)
 
-        text, keyboard = _render_album_artists_view(album_dir)
+        text, keyboard = _render_album_artists_view(album_dir, from_report=False)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1531,7 +1656,8 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         ctx.bot_data["artist_tracks"] = sorted(album_dir.rglob("*.flac"))
-        text, keyboard = _render_album_artists_view(album_dir)
+        from_report = bool(ctx.bot_data.get("artist_from_report"))
+        text, keyboard = _render_album_artists_view(album_dir, from_report=from_report)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1543,7 +1669,8 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         track_path = tracks[idx]
-        text, keyboard, other = _render_track_artist_card(track_path, idx)
+        from_report = bool(ctx.bot_data.get("artist_from_report"))
+        text, keyboard, other = _render_track_artist_card(track_path, idx, from_report=from_report)
         ctx.bot_data["artist_track_others"] = other
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
@@ -1562,7 +1689,8 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         add_track_artist(track_path, to_add)
         await query.answer(f"Добавлен: {to_add}")
 
-        text, keyboard, other = _render_track_artist_card(track_path, track_idx)
+        from_report = bool(ctx.bot_data.get("artist_from_report"))
+        text, keyboard, other = _render_track_artist_card(track_path, track_idx, from_report=from_report)
         ctx.bot_data["artist_track_others"] = other
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
@@ -1590,7 +1718,8 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             await query.answer("Ошибка при удалении артиста", show_alert=True)
             return
 
-        text, keyboard, other = _render_track_artist_card(track_path, track_idx)
+        from_report = bool(ctx.bot_data.get("artist_from_report"))
+        text, keyboard, other = _render_track_artist_card(track_path, track_idx, from_report=from_report)
         ctx.bot_data["artist_track_others"] = other
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
@@ -1644,7 +1773,8 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             "album_dir": str(album_dir),
             "card_msg_id": query.message.message_id,
         }
-        text, keyboard = _render_album_artists_all_prompt(album_dir)
+        from_report = bool(ctx.bot_data.get("artist_from_report"))
+        text, keyboard = _render_album_artists_all_prompt(album_dir, from_report=from_report)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1699,7 +1829,8 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             "card_msg_id": query.message.message_id,
         }
 
-        text, keyboard = _render_album_artist_edit_card(album_dir, suggestions)
+        from_report = bool(ctx.bot_data.get("artist_from_report"))
+        text, keyboard = _render_album_artist_edit_card(album_dir, suggestions, from_report=from_report)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1716,7 +1847,8 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             "card_msg_id": query.message.message_id,
         }
 
-        text, keyboard = _render_album_artist_custom_prompt(album_dir)
+        from_report = bool(ctx.bot_data.get("artist_from_report"))
+        text, keyboard = _render_album_artist_custom_prompt(album_dir, from_report=from_report)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1738,13 +1870,14 @@ async def on_artist_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             new_aa = suggestions[idx]
 
         new_folder, status_text = update_album_artist(album_dir, new_aa)
-        ctx.bot_data["artist_album_path"] = new_folder
-        ctx.bot_data["artist_tracks"] = sorted(new_folder.rglob("*.flac"))
+        _update_album_references(ctx, album_dir, new_folder)
         if f"artist_action_{OWNER_ID}" in ctx.bot_data:
             del ctx.bot_data[f"artist_action_{OWNER_ID}"]
 
-        await query.answer(f"✅ {status_text}")
-        text, keyboard = _render_album_artists_view(new_folder)
+        toast = f"✅ Папка переименована в:\n{new_folder.name}" if new_folder != album_dir else f"✅ {status_text}"
+        await query.answer(toast[:190], show_alert=(new_folder != album_dir))
+        from_report = bool(ctx.bot_data.get("artist_from_report"))
+        text, keyboard = _render_album_artists_view(new_folder, from_report=from_report)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1852,8 +1985,9 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
         ctx.bot_data["lyrics_tracks"] = tracks
         ctx.bot_data["lyrics_album_path"] = album_dir
+        ctx.bot_data["lyrics_from_report"] = album_dir.name
 
-        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks)
+        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks, from_report=True)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1874,8 +2008,9 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         tracks = sorted(album_dir.rglob("*.flac"))
         ctx.bot_data["lyrics_tracks"] = tracks
         ctx.bot_data["lyrics_album_path"] = album_dir
+        ctx.bot_data.pop("lyrics_from_report", None)
 
-        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks)
+        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks, from_report=False)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1886,7 +2021,8 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             await _safe_edit_message(query, "⚠️ Сессия устарела. Используй /lyrics.")
             return
 
-        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks)
+        from_report = bool(ctx.bot_data.get("lyrics_from_report"))
+        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks, from_report=from_report)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1897,7 +2033,8 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         track_path = tracks[idx]
-        text, keyboard = _render_track_lyrics_card(track_path, idx)
+        from_report = bool(ctx.bot_data.get("lyrics_from_report"))
+        text, keyboard = _render_track_lyrics_card(track_path, idx, from_report=from_report)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1948,7 +2085,8 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         else:
             await query.answer(f"✅ Текст загружен из {src_name}!")
 
-        text, keyboard = _render_track_lyrics_card(track_path, idx)
+        from_report = bool(ctx.bot_data.get("lyrics_from_report"))
+        text, keyboard = _render_track_lyrics_card(track_path, idx, from_report=from_report)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1973,7 +2111,8 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         loop = asyncio.get_running_loop()
         res, msg = await loop.run_in_executor(None, lambda: lm.ai_align_track(track_path))
 
-        text, keyboard = _render_track_lyrics_card(track_path, idx)
+        from_report = bool(ctx.bot_data.get("lyrics_from_report"))
+        text, keyboard = _render_track_lyrics_card(track_path, idx, from_report=from_report)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
         if res and res.is_synced:
@@ -2056,7 +2195,8 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
         success_count = await loop.run_in_executor(None, _run_albai)
 
-        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks)
+        from_report = bool(ctx.bot_data.get("lyrics_from_report"))
+        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks, from_report=from_report)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
         conf = await ctx.bot.send_message(
@@ -2127,7 +2267,8 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
         found_count = await loop.run_in_executor(None, _run_albmiss)
 
-        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks)
+        from_report = bool(ctx.bot_data.get("lyrics_from_report"))
+        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks, from_report=from_report)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
         conf = await ctx.bot.send_message(
@@ -2337,7 +2478,8 @@ async def on_owner_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             track_idx = action_data.get("track_idx")
 
             if card_id and track_idx is not None:
-                text, keyboard, other = _render_track_artist_card(track_path, track_idx)
+                from_report = bool(ctx.bot_data.get("artist_from_report"))
+                text, keyboard, other = _render_track_artist_card(track_path, track_idx, from_report=from_report)
                 ctx.bot_data["artist_track_others"] = other
                 try:
                     await ctx.bot.edit_message_text(
@@ -2365,7 +2507,8 @@ async def on_owner_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             track_idx = action_data.get("track_idx")
 
             if card_id and track_idx is not None:
-                text, keyboard, other = _render_track_artist_card(track_path, track_idx)
+                from_report = bool(ctx.bot_data.get("artist_from_report"))
+                text, keyboard, other = _render_track_artist_card(track_path, track_idx, from_report=from_report)
                 ctx.bot_data["artist_track_others"] = other
                 try:
                     await ctx.bot.edit_message_text(
@@ -2389,12 +2532,12 @@ async def on_owner_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         if action_data["type"] == "editall":
             album_dir = Path(action_data["album_dir"])
             new_folder, status_text = replace_all_tracks_artist(album_dir, user_text)
-            ctx.bot_data["artist_album_path"] = new_folder
-            ctx.bot_data["artist_tracks"] = sorted(new_folder.rglob("*.flac"))
+            _update_album_references(ctx, album_dir, new_folder)
 
             card_id = action_data.get("card_msg_id")
             if card_id:
-                text, keyboard = _render_album_artists_view(new_folder)
+                from_report = bool(ctx.bot_data.get("artist_from_report"))
+                text, keyboard = _render_album_artists_view(new_folder, from_report=from_report)
                 try:
                     await ctx.bot.edit_message_text(
                         chat_id=OWNER_ID,
@@ -2417,12 +2560,12 @@ async def on_owner_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         if action_data["type"] == "editaa":
             album_dir = Path(action_data["album_dir"])
             new_folder, status_text = update_album_artist(album_dir, user_text)
-            ctx.bot_data["artist_album_path"] = new_folder
-            ctx.bot_data["artist_tracks"] = sorted(new_folder.rglob("*.flac"))
+            _update_album_references(ctx, album_dir, new_folder)
 
             card_id = action_data.get("card_msg_id")
             if card_id:
-                text, keyboard = _render_album_artists_view(new_folder)
+                from_report = bool(ctx.bot_data.get("artist_from_report"))
+                text, keyboard = _render_album_artists_view(new_folder, from_report=from_report)
                 try:
                     await ctx.bot.edit_message_text(
                         chat_id=OWNER_ID,
@@ -2476,7 +2619,8 @@ async def on_owner_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         lrc_path.write_text(text_to_save, encoding="utf-8")
 
         if card_id:
-            text, keyboard = _render_track_lyrics_card(track_path, track_idx)
+            from_report = bool(ctx.bot_data.get("lyrics_from_report"))
+            text, keyboard = _render_track_lyrics_card(track_path, track_idx, from_report=from_report)
             try:
                 await ctx.bot.edit_message_text(
                     chat_id=OWNER_ID,

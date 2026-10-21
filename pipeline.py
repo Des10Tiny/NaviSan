@@ -190,29 +190,84 @@ def apply_pipeline(
 
 # ── Перенос в Library ────────────────────────────────────────────────────────
 
-def move_to_library(staging_folder: Path, library_root: Path) -> Path:
-    """Атомарно переносит обработанную папку из Staging в Library.
+def find_existing_library_album(staging_folder: Path, library_root: Path) -> Path | None:
+    """Ищет существующую папку альбома в Library для слияния.
 
-    Если в Library уже есть папка с таким именем — добавляет суффикс,
-    чтобы не перезаписывать существующий релиз.
+    Проверяет:
+    1. Точное совпадение имени папки ('Artist - Album').
+    2. Регистронезависимое совпадение имени папки.
+    3. Совпадение по тегам ARTIST и ALBUM.
+    """
+    if not library_root.exists():
+        return None
+
+    # 1. Точное совпадение
+    exact = library_root / staging_folder.name
+    if exact.exists() and exact.is_dir():
+        return exact
+
+    # 2. Регистронезависимое совпадение
+    st_name_lower = staging_folder.name.lower()
+    for existing in library_root.iterdir():
+        if existing.is_dir() and existing.name.lower() == st_name_lower:
+            return existing
+
+    # 3. Совпадение по тегам ARTIST и ALBUM
+    st_artist, st_album = album_info(staging_folder)
+    if st_artist and st_album:
+        norm_art = st_artist.lower().strip()
+        norm_alb = st_album.lower().strip()
+        expected_prefix = f"{norm_art} - {norm_alb}"
+
+        for existing in library_root.iterdir():
+            if not existing.is_dir():
+                continue
+            ex_name = existing.name.lower()
+            if ex_name.startswith(expected_prefix) or (norm_art in ex_name and norm_alb in ex_name):
+                ex_art, ex_alb = album_info(existing)
+                if ex_art.lower().strip() == norm_art and ex_alb.lower().strip() == norm_alb:
+                    return existing
+
+    return None
+
+
+def move_to_library(
+    staging_folder: Path,
+    library_root: Path,
+    has_chosen_cover: bool = False,
+) -> tuple[Path, dict]:
+    """Переносит обработанную папку из Staging в Library.
+
+    Если альбом уже есть в Library — объединяет файлы в существующую папку
+    без создания дубликата с суффиксом (2), вшивает обложку в новые треки
+    и пересчитывает единый ReplayGain для всего объединённого релиза.
 
     Returns:
-        Путь к папке в Library.
+        Кортеж (путь к целевой папке в Library, словарь со статистикой слияния).
     """
-    dest = library_root / staging_folder.name
-
-    # Защита от перезаписи существующего релиза.
-    if dest.exists():
-        counter = 2
-        while dest.exists():
-            dest = library_root / f"{staging_folder.name} ({counter})"
-            counter += 1
-        log.warning("Library: папка уже существует, сохраняю как %s", dest.name)
-
     library_root.mkdir(parents=True, exist_ok=True)
+    existing_dest = find_existing_library_album(staging_folder, library_root)
+
+    renamer = FileSystemManager()
+
+    if existing_dest is not None:
+        log.info("Library: найден существующий альбом '%s'. Запускаю слияние...", existing_dest.name)
+        info = renamer.merge_folders(staging_folder, existing_dest, has_chosen_cover=has_chosen_cover)
+        info["merged"] = True
+        return existing_dest, info
+
+    dest = library_root / staging_folder.name
     shutil.move(str(staging_folder), str(dest))
     log.info("Library: перенесено %s → %s", staging_folder.name, dest)
-    return dest
+    all_flacs = list(dest.rglob("*.flac"))
+    return dest, {
+        "merged": False,
+        "added_tracks": [f.name for f in all_flacs],
+        "updated_tracks": [],
+        "total_flacs": len(all_flacs),
+        "rg_ok": True,
+        "rg_msg": "OK",
+    }
 
 
 def cleanup_inbox(inbox_folder: Path) -> None:
@@ -391,8 +446,15 @@ def update_album_artist(folder: Path, new_album_artist: str) -> tuple[Path, str]
 
     renamer = FileSystemManager()
     new_folder_str = renamer.rename_album_folder(str(folder))
-    status_str = f"Альбом-артист обновлён на: {', '.join(aa_list)}" if aa_list else "Тег ALBUMARTIST удалён"
-    return Path(new_folder_str), status_str
+    new_folder = Path(new_folder_str)
+
+    aa_display = ", ".join(aa_list) if aa_list else "удалён"
+    if new_folder.name != folder.name:
+        status_str = f"ALBUMARTIST обновлён на: {aa_display}\n📂 Папка переименована в `{new_folder.name}`"
+    else:
+        status_str = f"ALBUMARTIST обновлён на: {aa_display}"
+
+    return new_folder, status_str
 
 
 def replace_all_tracks_artist(folder: Path, new_artist: str) -> tuple[Path, str]:
@@ -419,8 +481,14 @@ def replace_all_tracks_artist(folder: Path, new_artist: str) -> tuple[Path, str]
 
     renamer = FileSystemManager()
     new_folder_str = renamer.rename_album_folder(str(folder))
-    status_str = f"Исполнитель во всех треках обновлён на: {raw}"
-    return Path(new_folder_str), status_str
+    new_folder = Path(new_folder_str)
+
+    if new_folder.name != folder.name:
+        status_str = f"Исполнитель во всех треках: {raw}\n📂 Папка переименована в `{new_folder.name}`"
+    else:
+        status_str = f"Исполнитель во всех треках: {raw}"
+
+    return new_folder, status_str
 
 
 def set_track_artists(track_path: Path, new_artists_str: str) -> list[str]:
