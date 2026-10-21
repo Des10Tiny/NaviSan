@@ -33,6 +33,7 @@ class FLACSurgeon:
         "rating", "compilation",
         "replaygain_track_gain", "replaygain_track_peak",
         "replaygain_album_gain", "replaygain_album_peak",
+        "replaygain_reference_loudness",
     })
 
     def __init__(self, sanitizer: TagSanitizer) -> None:

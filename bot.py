@@ -866,10 +866,11 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
             if now - last_edit_time > 2.0 or cur == tot:
                 last_edit_time = now
                 pct = int((cur / tot) * 100)
+                rg_str = " | 🔊 RG: +" if res.get("replaygain_added") else ""
                 txt = (
                     f"⏳ *Идеализация библиотеки: {cur}/{tot} ({pct}%)*\n\n"
                     f"💿 Текущий: *{alb_name}*\n"
-                    f"📝 Тексты: +{res.get('lyrics_added', 0)} | 🖼️ Обложка: {'+' if res.get('cover_added') else 'OK'}\n\n"
+                    f"📝 Тексты: +{res.get('lyrics_added', 0)} | 🖼️ Обложка: {'+' if res.get('cover_added') else 'OK'}{rg_str}\n\n"
                     f"_Пожалуйста, подожди завершения…_"
                 )
                 kb = [[InlineKeyboardButton("⏹️ Остановить", callback_data="upgrade:stop")]]
@@ -902,11 +903,13 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
             ctx.bot_data["upgrade_running"] = False
 
         stopped_str = " (прервано пользователем)" if ctx.bot_data.get("upgrade_cancelled") else ""
+        rg_added_str = f"\n🔊 ReplayGain рассчитан: *{summary.get('replaygain_added', 0)}* альбомов" if summary.get("replaygain_added") else ""
         final_text = (
             f"✅ *Идеализация библиотеки завершена{stopped_str}!* 🎉\n\n"
             f"💿 Обработано альбомов: *{summary['processed']}/{summary['total']}*\n"
             f"🖼️ Добавлено обложек: *{summary['covers_added']}*\n"
             f"📝 Загружено текстов (.lrc): *{summary['lyrics_added']}*"
+            f"{rg_added_str}"
         )
         final_kb = [[InlineKeyboardButton("❌ Закрыть", callback_data="upgrade:close")]]
         await _safe_edit_message(query, final_text, reply_markup=InlineKeyboardMarkup(final_kb))
@@ -983,10 +986,14 @@ def _render_album_lyrics_tracklist(album_dir: Path, tracks: list[Path]) -> tuple
 
 def _render_track_lyrics_card(track_path: Path, track_idx: int) -> tuple[str, list[list[InlineKeyboardButton]]]:
     """Формирует карточку трека с превью текста и кнопками смены источника."""
+    rg_str = ""
     try:
         audio = FLAC(str(track_path))
         artist = audio.get("artist", audio.get("albumartist", [""]))[0]
         title = audio.get("title", [""])[0]
+        rg_val = audio.get("replaygain_track_gain", [""])[0]
+        if rg_val:
+            rg_str = f" | 🔊 `{rg_val}`"
     except Exception:
         artist, title = "", ""
 
@@ -1013,7 +1020,7 @@ def _render_track_lyrics_card(track_path: Path, track_idx: int) -> tuple[str, li
     text = (
         f"🎵 *{header_artist}{title}*\n"
         f"📂 `{track_path.name}`\n"
-        f"📊 Статус: {status}\n\n"
+        f"📊 Статус: {status}{rg_str}\n\n"
         f"📝 *Превью текста:*\n```\n{preview}\n```"
     )
 

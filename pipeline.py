@@ -177,6 +177,14 @@ def apply_pipeline(
     new_folder = Path(renamer.rename_album_folder(str(folder)))
     report.append(f"📁 `{new_folder.name}`")
 
+    # Расчёт ReplayGain (потрековый и альбомный)
+    from replaygain import apply_replaygain
+    rg_ok, rg_msg = apply_replaygain(new_folder)
+    if rg_ok:
+        report.append("🔊 ReplayGain: рассчитан (Track & Album Gain)")
+    else:
+        report.append(f"⚠️ ReplayGain: {rg_msg}")
+
     return report, new_folder
 
 
@@ -508,6 +516,13 @@ def upgrade_album(
     new_folder_str = renamer.rename_album_folder(str(album_dir))
     new_folder = Path(new_folder_str)
 
+    # Шаг 5: Проверка и расчёт ReplayGain
+    from replaygain import album_has_replaygain, apply_replaygain
+    replaygain_added = False
+    if not album_has_replaygain(new_folder):
+        rg_ok, _ = apply_replaygain(new_folder)
+        replaygain_added = rg_ok
+
     return {
         "old_folder": album_dir.name,
         "new_folder": new_folder.name,
@@ -515,6 +530,7 @@ def upgrade_album(
         "tracks_count": len(flac_files),
         "cover_added": cover_added,
         "lyrics_added": lyrics_added,
+        "replaygain_added": replaygain_added,
     }
 
 
@@ -534,6 +550,7 @@ def upgrade_library(
     processed = 0
     total_covers = 0
     total_lyrics = 0
+    total_rg = 0
     results = []
 
     for i, album_folder in enumerate(all_albums, 1):
@@ -546,6 +563,8 @@ def upgrade_library(
         if res.get("cover_added"):
             total_covers += 1
         total_lyrics += res.get("lyrics_added", 0)
+        if res.get("replaygain_added"):
+            total_rg += 1
         results.append(res)
 
         if progress_callback:
@@ -559,5 +578,6 @@ def upgrade_library(
         "processed": processed,
         "covers_added": total_covers,
         "lyrics_added": total_lyrics,
+        "replaygain_added": total_rg,
         "results": results,
     }
