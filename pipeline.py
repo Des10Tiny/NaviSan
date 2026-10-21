@@ -123,10 +123,17 @@ def update_album_cover(folder: Path, cover: CoverCandidate) -> str:
             audio.clear_pictures()
             audio.add_picture(pic)
             if cover.date:
-                existing = audio.get("date", audio.get("year", [""]))[0]
-                if not existing or _date_is_more_specific(cover.date, existing):
+                m_y = re.search(r"\b(\d{4})\b", cover.date)
+                cov_year = m_y.group(1) if m_y else cover.date[:4]
+                existing_date = audio.get("date", [""])[0].strip()
+                existing_year = audio.get("year", [""])[0].strip()
+                if not existing_date or _date_is_more_specific(cover.date, existing_date):
                     audio["date"] = [cover.date]
-                    audio["year"] = [cover.date[:4]]
+                    audio["year"] = [cov_year]
+                elif len(existing_year) > 4:
+                    m_ey = re.search(r"\b(\d{4})\b", existing_year)
+                    if m_ey:
+                        audio["year"] = [m_ey.group(1)]
             audio.save()
         except Exception as e:
             log.warning("Не удалось обновить обложку в %s: %s", f.name, e)
@@ -294,16 +301,32 @@ def _date_is_more_specific(new_date: str, existing_date: str) -> bool:
 
 def _apply_date_to_flacs(folder: Path, date_str: str) -> None:
     """Записывает дату в теги DATE/YEAR всех FLAC в папке (если новая специфичнее)."""
-    year = date_str[:4]
+    m = re.search(r"\b(\d{4})\b", date_str)
+    year = m.group(1) if m else date_str[:4]
     for f in folder.rglob("*.flac"):
         try:
             audio = FLAC(str(f))
-            existing = audio.get("date", audio.get("year", [""]))[0]
-            if existing and not _date_is_more_specific(date_str, existing):
-                continue
-            audio["date"] = [date_str]
-            audio["year"] = [year]
-            audio.save()
+            existing_date = audio.get("date", [""])[0].strip()
+            existing_year = audio.get("year", [""])[0].strip()
+
+            changed = False
+            # Если в year записана полная дата вместо 4 цифр года — исправляем
+            if len(existing_year) > 4:
+                m_ey = re.search(r"\b(\d{4})\b", existing_year)
+                if m_ey:
+                    audio["year"] = [m_ey.group(1)]
+                    changed = True
+
+            if not existing_date or _date_is_more_specific(date_str, existing_date):
+                audio["date"] = [date_str]
+                audio["year"] = [year]
+                changed = True
+            elif not existing_year and year:
+                audio["year"] = [year]
+                changed = True
+
+            if changed:
+                audio.save()
         except Exception as e:
             log.warning("Не удалось записать дату в %s: %s", f.name, e)
 

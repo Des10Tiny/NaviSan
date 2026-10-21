@@ -126,7 +126,7 @@ class FLACSurgeon:
                     v_str = str(v).strip()
                     if not v_str:
                         continue
-                    if lower_key in ("year", "date", "originaldate") and v_str in ("0", "0000"):
+                    if lower_key in ("year", "date", "originaldate") and (v_str in ("0", "0000", "0000-00-00", "0-0-0", "00-00-0000") or re.match(r"^0+[-./]?0*$", v_str)):
                         continue
                     if lower_key in ("tracktotal", "disctotal") and v_str == "0":
                         continue
@@ -175,11 +175,64 @@ class FLACSurgeon:
         # 4. Вшивание обложки из cover.jpg
         self._embed_cover_from_file(audio, path.parent, force_update)
 
-        # 5. Синхронизация DATE и YEAR
-        if "date" in audio and "year" not in audio:
-            audio["year"] = [str(audio["date"][0])[:4]]
-        elif "year" in audio and "date" not in audio:
-            audio["date"] = audio["year"]
+        # 5. Нормализация и синхронизация полей DATE и YEAR
+        def _clean_date_str(s: str) -> str:
+            if not s:
+                return ""
+            # Отрезаем временную метку (T00:00:00Z или пробел)
+            s = s.split("T")[0].split(" ")[0].strip()
+            s = s.replace("/", "-")
+            m_eu = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", s)
+            if m_eu:
+                s = f"{m_eu.group(3)}-{m_eu.group(2)}-{m_eu.group(1)}"
+            if re.match(r"^0+[-./]?0*$", s):
+                return ""
+            return s
+
+        raw_date = audio.get("date", [""])[0].strip()
+        raw_year = audio.get("year", [""])[0].strip()
+        raw_orig = audio.get("originaldate", [""])[0].strip()
+
+        clean_date = _clean_date_str(raw_date)
+        clean_year = _clean_date_str(raw_year)
+        clean_orig = _clean_date_str(raw_orig)
+
+        if clean_orig and clean_orig != raw_orig:
+            audio["originaldate"] = [clean_orig]
+
+        # Определяем наиболее точную полную дату для тега DATE.
+        # Если риппер ошибочно записал полную дату (например, 2024-05-17) в YEAR, переносим её в DATE.
+        best_full_date = ""
+        if len(clean_year) > len(clean_date):
+            best_full_date = clean_year
+        elif clean_date:
+            best_full_date = clean_date
+        elif clean_orig:
+            best_full_date = clean_orig
+
+        # Извлекаем строго 4-значный год (YYYY) для тега YEAR
+        year_4_digits = ""
+        for cand in (clean_year, clean_date, clean_orig, raw_year, raw_date):
+            m = re.search(r"\b(19\d{2}|20\d{2})\b", cand)
+            if not m:
+                m = re.search(r"\b(\d{4})\b", cand)
+            if m:
+                year_4_digits = m.group(1)
+                break
+
+        # DATE содержит полную дату (YYYY-MM-DD или YYYY)
+        if best_full_date:
+            audio["date"] = [best_full_date]
+        elif year_4_digits:
+            audio["date"] = [year_4_digits]
+        elif "date" in audio:
+            del audio["date"]
+
+        # YEAR содержит СТРОГО 4 цифры года (YYYY)
+        if year_4_digits:
+            audio["year"] = [year_4_digits]
+        elif "year" in audio:
+            del audio["year"]
 
         # 6. Сохранение изменений
         audio.save()

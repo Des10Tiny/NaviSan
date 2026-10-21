@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import requests
@@ -110,83 +112,159 @@ class LyricManager:
             log.debug("LRCLIB exact match error: %s", e)
 
         # Шаг 2: Мягкий поиск по ключевым словам
-        try:
-            r = requests.get(
-                "https://lrclib.net/api/search",
-                params={"q": f"{artist} {title}"},
-                headers=headers,
-                timeout=8,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list):
-                    best_plain = None
-                    for item in data:
-                        api_artist = item.get("artistName", "").lower()
-                        api_title = item.get("trackName", "").lower()
-                        if artist.lower() not in api_artist and title.lower() not in api_title:
-                            continue
+        artist_tokens = [a.strip() for a in re.split(r"[,;&]|\s+(?:feat\.?|ft\.?|x|and)\s+", artist, flags=re.I) if a.strip()]
+        expanded_queries = [f"{artist} {title}"]
+        for tok in artist_tokens:
+            spaced = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", tok)
+            for t_var in (tok, spaced):
+                q_var = f"{t_var} {title}"
+                if q_var not in expanded_queries:
+                    expanded_queries.append(q_var)
 
-                        synced = item.get("syncedLyrics")
-                        plain = item.get("plainLyrics")
-                        if synced:
-                            return (
-                                LyricResult(text=synced, is_synced=True, source="lrclib", track_title=title, artist=artist),
-                                LyricResult(text=plain, is_synced=False, source="lrclib", track_title=title, artist=artist) if plain else None,
-                            )
-                        if plain and not best_plain:
-                            best_plain = LyricResult(text=plain, is_synced=False, source="lrclib", track_title=title, artist=artist)
-                    if best_plain:
-                        return None, best_plain
-        except Exception as e:
-            log.debug("LRCLIB search error: %s", e)
+        for q in expanded_queries:
+            try:
+                r = requests.get(
+                    "https://lrclib.net/api/search",
+                    params={"q": q},
+                    headers=headers,
+                    timeout=8,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, list):
+                        best_plain = None
+                        for item in data:
+                            api_artist = item.get("artistName", "").lower()
+                            api_title = item.get("trackName", "").lower()
+                            if title.lower() not in api_title:
+                                continue
+
+                            synced = item.get("syncedLyrics")
+                            plain = item.get("plainLyrics")
+                            if synced:
+                                return (
+                                    LyricResult(text=synced, is_synced=True, source="lrclib", track_title=title, artist=artist),
+                                    LyricResult(text=plain, is_synced=False, source="lrclib", track_title=title, artist=artist) if plain else None,
+                                )
+                            if plain and not best_plain:
+                                best_plain = LyricResult(text=plain, is_synced=False, source="lrclib", track_title=title, artist=artist)
+                        if best_plain:
+                            return None, best_plain
+            except Exception as e:
+                log.debug("LRCLIB search error: %s", e)
 
         return None, None
 
     # ── 2. Genius ─────────────────────────────────────────────────────────────
 
     def _fetch_genius(self, artist: str, title: str) -> LyricResult | None:
-        """Ищет эталонный текст песни на Genius.com без авторизации."""
+        """Ищет эталонный текст песни на Genius.com с ранжированием релевантности кандидатов."""
         headers = {"User-Agent": self.BROWSER_UA}
+
+        def norm(s: str) -> str:
+            return re.sub(r"[^\w]", "", (s or "").lower())
+
+        artist_tokens = [a.strip() for a in re.split(r"[,;&]|\s+(?:feat\.?|ft\.?|x|and)\s+", artist, flags=re.I) if a.strip()]
+        expanded_tokens = []
+        for a in artist_tokens:
+            if a not in expanded_tokens:
+                expanded_tokens.append(a)
+            spaced = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", a)
+            if spaced != a and spaced not in expanded_tokens:
+                expanded_tokens.append(spaced)
+
+        queries = [f"{artist} {title}"]
+        for tok in expanded_tokens:
+            q_tok = f"{tok} {title}"
+            if q_tok not in queries:
+                queries.append(q_tok)
+        if len(expanded_tokens) >= 2:
+            queries.insert(1, f"{expanded_tokens[0]} {expanded_tokens[1]} {title}")
+
+        target_title_norm = norm(title)
+        clean_target_arts = [norm(a) for a in expanded_tokens if len(norm(a)) > 1]
+
+        all_hits: list[dict] = []
+        seen_urls = set()
+
+        for q in queries:
+            try:
+                r = requests.get(
+                    "https://genius.com/api/search/multi",
+                    params={"q": q},
+                    headers=headers,
+                    timeout=8,
+                )
+                if r.status_code == 200:
+                    sections = r.json().get("response", {}).get("sections", [])
+                    found_song_in_q = False
+                    for s in sections:
+                        for h in s.get("hits", []):
+                            if h.get("type") == "song" or s.get("type") == "song":
+                                res = h.get("result", {})
+                                url = res.get("url")
+                                if url and url not in seen_urls:
+                                    seen_urls.add(url)
+                                    all_hits.append(res)
+                                    found_song_in_q = True
+                    if found_song_in_q and len(all_hits) >= 2:
+                        break
+            except Exception as e:
+                log.debug("Genius search query '%s' error: %s", q, e)
+
+        if not all_hits:
+            return None
+
+        # Ранжирование кандидатов
+        best_hit = None
+        best_score = -1
+
+        for res in all_hits:
+            hit_title = res.get("title", "")
+            art_names = (res.get("artist_names", "") + " " + res.get("primary_artist", {}).get("name", "")).lower()
+
+            if "translation" in hit_title.lower() or "translation" in art_names:
+                continue
+            if "remix" in hit_title.lower() and "remix" not in title.lower():
+                continue
+
+            hit_title_norm = norm(hit_title)
+            if not hit_title_norm:
+                continue
+
+            score = 0
+            # 1. Совпадение названия
+            if hit_title_norm == target_title_norm:
+                score += 60
+                if hit_title.strip().lower() == title.strip().lower():
+                    score += 20
+            else:
+                sim = SequenceMatcher(None, target_title_norm, hit_title_norm).ratio()
+                if sim >= 0.8:
+                    score += int(sim * 50)
+                else:
+                    continue  # Название слишком отличается
+
+            # 2. Совпадение артистов (чем больше артистов релиза совпало, тем выше балл)
+            cand_art_norm = norm(art_names)
+            matched_arts = sum(1 for a in clean_target_arts if a in cand_art_norm)
+            if not matched_arts:
+                continue
+
+            score += matched_arts * 30
+
+            if score > best_score:
+                best_score = score
+                best_hit = res
+
+        if not best_hit:
+            return None
+
+        song_url = best_hit.get("url")
+        if not song_url:
+            return None
+
         try:
-            r = requests.get(
-                "https://genius.com/api/search/multi",
-                params={"q": f"{artist} {title}"},
-                headers=headers,
-                timeout=10,
-            )
-            if r.status_code != 200:
-                return None
-
-            sections = r.json().get("response", {}).get("sections", [])
-            hits = []
-            for s in sections:
-                if s.get("type") == "song":
-                    hits = s.get("hits", [])
-                    break
-            if not hits:
-                return None
-
-            # Отсеиваем переводы (Translations) и выбираем лучшее совпадение по артисту
-            best_hit = None
-            artist_parts = [p.lower() for p in artist.split() if len(p) > 2]
-            for h in hits:
-                song = h.get("result", {})
-                art_names = (song.get("artist_names", "") + " " + song.get("primary_artist", {}).get("name", "")).lower()
-                title_name = song.get("title", "").lower()
-                if "translation" in title_name or "translation" in art_names:
-                    continue
-                if any(part in art_names for part in artist_parts):
-                    best_hit = song
-                    break
-
-            if not best_hit:
-                best_hit = hits[0].get("result", {})
-
-            song_url = best_hit.get("url")
-            if not song_url:
-                return None
-
             page = requests.get(song_url, headers=headers, timeout=10)
             if page.status_code != 200:
                 return None
@@ -524,7 +602,7 @@ class LyricManager:
                     track_title=path.stem,
                 )
                 return res, "Таймкоды успешно расставлены нейросетью ✨"
-            return None, "Нейросети не удалось распознать слова в аудио"
+            return None, "Нейросети не удалось сопоставить слова с аудио (текст не совпадает с песней)"
         except Exception as e:
             log.error("Ошибка при AI-выравнивании %s: %s", path.name, e)
             return None, f"Ошибка нейросети: {e}"

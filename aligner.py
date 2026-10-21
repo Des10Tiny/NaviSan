@@ -90,10 +90,23 @@ def align_lyrics(
             model = WhisperModel(model_size, device="cpu", compute_type="int8")
             should_cleanup_model = True
 
+        # Автоопределение языка по тексту песни, если не задан явно
+        if not language and plain_text:
+            if re.search(r"[а-яА-ЯёЁ]", plain_text):
+                language = "ru"
+            elif re.search(r"[a-zA-Z]", plain_text):
+                language = "en"
+
+        # Первые слова песни в качестве initial_prompt (до 50 слов без заголовков в скобках)
+        words_prompt = " ".join([w for w in plain_text.split() if not (w.startswith("[") and w.endswith("]"))][:50])
+
         segments, info = model.transcribe(
             str(audio_path),
             word_timestamps=True,
             language=language,
+            condition_on_previous_text=False,
+            vad_filter=True,
+            initial_prompt=words_prompt or None,
         )
 
         for segment in segments:
@@ -125,50 +138,121 @@ def align_lyrics(
     except ImportError:
         fuzz = None
 
-    synced_lines: list[str] = []
+    line_results: list[dict] = []
     w_idx = 0
     total_words = len(whisper_words)
+    unmatched_streak = 0
+    matched_lines_count = 0
+    total_vocal_lines = 0
 
     for orig_idx, line, is_header in cleaned_lines:
         # Служебные заголовки секций Genius ([Куплет 1], [Припев]) не выравниваем
         if is_header:
-            synced_lines.append(line)
+            line_results.append({"line": line, "time": None, "is_header": True})
             continue
 
         line_words = [_clean_word(w) for w in line.split() if _clean_word(w)]
         if not line_words:
-            synced_lines.append(line)
+            line_results.append({"line": line, "time": None, "is_header": False})
             continue
 
+        total_vocal_lines += 1
         start_time: float | None = None
 
         if w_idx < total_words:
-            # Ищем начало строки по первым 2-3 словам с опережающим сканированием
-            target = " ".join(line_words[:3])
+            # Ищем начало строки по первым 3-4 словам с адаптивным опережающим окном
+            words_to_match = min(4, len(line_words))
+            target = " ".join(line_words[:words_to_match])
             best_score = -1
             best_idx = w_idx
-            scan_window = min(total_words, w_idx + 18)
+            # Окно поиска расширяется при нескольких подряд ненайденных строках
+            scan_window = min(total_words, w_idx + 25 + unmatched_streak * 10)
 
             for scan_idx in range(w_idx, scan_window):
-                cand_len = min(3, total_words - scan_idx)
+                cand_len = min(words_to_match, total_words - scan_idx)
                 cand = " ".join(whisper_words[scan_idx + k]["word"] for k in range(cand_len))
 
-                score = fuzz.ratio(target, cand) if fuzz else (100 if target in cand else 0)
+                if fuzz:
+                    # Используем максимум между ratio и token_sort_ratio для компенсации пропущенных предлогов (и, а, в)
+                    score = max(fuzz.ratio(target, cand), fuzz.token_sort_ratio(target, cand))
+                else:
+                    score = 100 if target in cand else 0
+
                 if score > best_score:
                     best_score = score
                     best_idx = scan_idx
                 if score >= 90:
                     break
 
-            start_time = whisper_words[best_idx]["start"]
-            w_idx = min(total_words - 1, best_idx + max(1, len(line_words) - 1))
+            # Принимаем таймкод только если сходство слов достаточного качества (>= 55%)
+            if best_score >= 55:
+                start_time = whisper_words[best_idx]["start"]
+                # Продвигаем указатель ровно на фактически распознанные Whisper слова этой строки,
+                # а не на длину всей строки текста, чтобы не обогнать аудио
+                matched_span = min(words_to_match, len(line_words))
+                for k in range(matched_span, min(len(line_words), total_words - best_idx)):
+                    w_cand = whisper_words[best_idx + k]["word"]
+                    w_ref = line_words[k]
+                    sim = fuzz.ratio(w_ref, w_cand) if fuzz else (100 if w_ref == w_cand else 0)
+                    if sim >= 60:
+                        matched_span = k + 1
+                    else:
+                        break
 
-        if start_time is not None:
-            total_sec = max(0.0, start_time)
+                w_idx = min(total_words - 1, best_idx + max(1, matched_span))
+                unmatched_streak = 0
+                matched_lines_count += 1
+            else:
+                unmatched_streak += 1
+
+        line_results.append({"line": line, "time": start_time, "is_header": False})
+
+    # Проверка на полное несовпадение текста и аудио (чужая песня)
+    if total_vocal_lines > 0:
+        match_ratio = matched_lines_count / total_vocal_lines
+        if match_ratio < 0.35:
+            log.warning(
+                "Forced alignment mismatch: текст не соответствует аудио %s (совпало всего %d/%d строк, %.1f%%). Выравнивание отменено.",
+                audio_path,
+                matched_lines_count,
+                total_vocal_lines,
+                match_ratio * 100,
+            )
+            return plain_text
+
+    # Интерполяция таймкодов для пропущенных вокальных строк (если песня совпала)
+    vocal_indices = [i for i, r in enumerate(line_results) if not r["is_header"] and r["line"].strip()]
+    for i, idx in enumerate(vocal_indices):
+        if line_results[idx]["time"] is None:
+            prev_t = None
+            for p in range(i - 1, -1, -1):
+                t = line_results[vocal_indices[p]]["time"]
+                if t is not None:
+                    prev_t = t
+                    break
+            next_t = None
+            for n in range(i + 1, len(vocal_indices)):
+                t = line_results[vocal_indices[n]]["time"]
+                if t is not None:
+                    next_t = t
+                    break
+
+            if prev_t is not None and next_t is not None:
+                line_results[idx]["time"] = prev_t + (next_t - prev_t) * 0.5
+            elif prev_t is not None:
+                line_results[idx]["time"] = prev_t + 2.5
+            elif next_t is not None:
+                line_results[idx]["time"] = max(0.0, next_t - 2.5)
+
+    synced_lines: list[str] = []
+    for r in line_results:
+        t = r["time"]
+        if t is not None:
+            total_sec = max(0.0, t)
             m = int(total_sec // 60)
             s = total_sec % 60
-            synced_lines.append(f"[{m:02d}:{s:05.2f}] {line}")
+            synced_lines.append(f"[{m:02d}:{s:05.2f}] {r['line']}")
         else:
-            synced_lines.append(line)
+            synced_lines.append(r["line"])
 
     return "\n".join(synced_lines)
