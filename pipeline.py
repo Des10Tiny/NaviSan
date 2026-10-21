@@ -499,7 +499,7 @@ def upgrade_album(
             lrc_path = Path(new_flac).with_suffix(".lrc")
             if not lrc_path.exists():
                 res_status = lyricist.process_file(new_flac)
-                if "LRCLIB" in res_status or "Genius" in res_status:
+                if any(k in res_status for k in ("Синхронизированный", "Обычный текст", "LRCLIB", "SyncedLyrics", "Genius")):
                     lyrics_added += 1
         except Exception as e:
             log.warning("Ошибка обработки трека %s: %s", flac.name, e)

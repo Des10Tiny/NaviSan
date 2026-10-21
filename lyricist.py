@@ -221,6 +221,40 @@ class LyricManager:
 
         return None
 
+    # ── 3. SyncedLyrics (NetEase, Megalobiz, Musixmatch) ─────────────────────
+
+    def _fetch_syncedlyrics(self, artist: str, title: str) -> LyricResult | None:
+        """Ищет синхронизированный караоке-текст через провайдеры syncedlyrics."""
+        search_query = f"{artist} {title}".strip()
+        if not search_query:
+            return None
+
+        try:
+            import syncedlyrics
+            from syncedlyrics.providers.base import TimeoutSession
+
+            # Увеличиваем таймаут подключения до 5 секунд для надёжной связи с зарубежными базами
+            def _custom_timeout_request(session_self, method, url, **kwargs):
+                kwargs["timeout"] = (5, 12)
+                return super(TimeoutSession, session_self).request(method, url, **kwargs)
+
+            TimeoutSession.request = _custom_timeout_request
+
+            # Ищем исключительно синхронизированный текст (с таймкодами)
+            lrc_text = syncedlyrics.search(search_query, synced_only=True)
+            if lrc_text and has_timestamps(lrc_text):
+                return LyricResult(
+                    text=lrc_text.strip(),
+                    is_synced=True,
+                    source="syncedlyrics",
+                    track_title=title,
+                    artist=artist,
+                )
+        except Exception as e:
+            log.debug("syncedlyrics error for '%s — %s': %s", artist, title, e)
+
+        return None
+
     # ── Каскадный поиск ───────────────────────────────────────────────────────
 
     def find_lyrics(
@@ -236,21 +270,30 @@ class LyricManager:
         if preferred_source == "lrclib":
             synced, plain = self._fetch_lrclib(artist, title, album, duration)
             return synced or plain
+        if preferred_source == "syncedlyrics":
+            return self._fetch_syncedlyrics(artist, title)
         if preferred_source == "genius":
             return self._fetch_genius(artist, title)
 
         # 2. Автоматический каскад:
-        # Фаза 1: Синхронизированный текст (Караоке с таймкодами)
+        # Фаза 1: Синхронизированный текст (LRCLIB)
         lrclib_synced, lrclib_plain = self._fetch_lrclib(artist, title, album, duration)
         if lrclib_synced:
             log.info("  ✓ Найдено караоке [LRCLIB]: %s — %s", artist, title)
             return lrclib_synced
 
-        # Фаза 2: Обычный текст (Plain)
+        # Фаза 2: Синхронизированный текст через мульти-провайдер syncedlyrics (NetEase, Megalobiz, Musixmatch)
+        synced_res = self._fetch_syncedlyrics(artist, title)
+        if synced_res and synced_res.is_synced:
+            log.info("  ✓ Найдено караоке [SyncedLyrics]: %s — %s", artist, title)
+            return synced_res
+
+        # Фаза 3: Обычный текст (Plain) — из первого запроса LRCLIB
         if lrclib_plain:
             log.info("  ✓ Найден текст [LRCLIB]: %s — %s", artist, title)
             return lrclib_plain
 
+        # Фаза 4: Эталонный plain-текст с Genius
         genius_plain = self._fetch_genius(artist, title)
         if genius_plain:
             log.info("  ✓ Найден текст [Genius]: %s — %s", artist, title)
@@ -266,7 +309,7 @@ class LyricManager:
 
         Returns:
             Строку-статус для отчёта:
-            "Караоке [LRCLIB] ✨" | "Текст [Genius] 📄" | "Уже есть 📁" | "Не найдено ❌"
+            "Синхронизированный [LRCLIB] 🎤" | "Обычный текст [Genius] 📄" | "Уже есть 📁" | "Не найдено ❌"
         """
         path = Path(filepath)
         if path.suffix.lower() != ".flac":
@@ -293,7 +336,13 @@ class LyricManager:
             res = self.find_lyrics(artist, title, album, duration)
             if res and res.text:
                 lrc_path.write_text(res.text, encoding="utf-8")
-                source_label = "LRCLIB" if res.source == "lrclib" else "Genius"
+                source_labels = {
+                    "lrclib": "LRCLIB",
+                    "syncedlyrics": "SyncedLyrics",
+                    "genius": "Genius",
+                    "manual": "Вручную",
+                }
+                source_label = source_labels.get(res.source, res.source.upper())
 
                 if res.is_synced:
                     return f"Синхронизированный [{source_label}] 🎤"

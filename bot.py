@@ -995,6 +995,7 @@ def _render_track_lyrics_card(track_path: Path, track_idx: int) -> tuple[str, li
     keyboard = [
         [
             InlineKeyboardButton("🔍 LRCLIB", callback_data=f"lyrics:src:lrclib:{track_idx}"),
+            InlineKeyboardButton("🔍 SyncedLyrics", callback_data=f"lyrics:src:syncedlyrics:{track_idx}"),
             InlineKeyboardButton("🔍 Genius", callback_data=f"lyrics:src:genius:{track_idx}"),
         ],
         [
@@ -1775,7 +1776,7 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         except Exception:
             artist, title, album, duration = "", track_path.stem, "", 0
 
-        source_names = {"lrclib": "LRCLIB", "genius": "Genius"}
+        source_names = {"lrclib": "LRCLIB", "syncedlyrics": "SyncedLyrics", "genius": "Genius"}
         src_name = source_names.get(source, source)
 
         lm = LyricManager()
