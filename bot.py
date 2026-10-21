@@ -42,7 +42,7 @@ from telegram.ext import (
 )
 
 from covers import CoverCandidate, search_covers
-from lyricist import LyricManager, has_timestamps, preview_lyrics
+from lyricist import LyricManager, has_timestamps, preview_lyrics, audit_library_lyrics
 from pipeline import (
     album_info,
     apply_cover,
@@ -933,25 +933,50 @@ def _render_album_lyrics_tracklist(album_dir: Path, tracks: list[Path]) -> tuple
     lines = [f"📝 *Тексты альбома:*\n🎵 *{title_str}*\n"]
     buttons = []
 
+    n_synced = 0
+    n_plain = 0
+    n_missing = 0
+
     for i, flac in enumerate(tracks):
         lrc = flac.with_suffix(".lrc")
         if lrc.exists():
             try:
                 content = lrc.read_text(encoding="utf-8")
-                icon = "🎤" if has_timestamps(content) else "📄"
+                if has_timestamps(content):
+                    icon = "🎤"
+                    n_synced += 1
+                else:
+                    icon = "📄"
+                    n_plain += 1
             except Exception:
                 icon = "📄"
+                n_plain += 1
         else:
             icon = "❌"
+            n_missing += 1
 
         lines.append(f"{i + 1}. {icon} `{flac.name}`")
         buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"lyrics:tr:{i}"))
 
-    lines.append("\n_Обозначения: 🎤 — синхронизированный текст, 📄 — обычный текст, ❌ — текста нет_\n")
-    lines.append("Нажми номер трека, чтобы просмотреть или сменить текст:")
+    lines.append(f"\n📊 Статус: 🎤 {n_synced} | 📄 {n_plain} | ❌ {n_missing}")
+    lines.append("_Обозначения: 🎤 — синхронизированный текст, 📄 — обычный текст, ❌ — текста нет_\n")
+    lines.append("Нажми номер трека для настройки или выбери пакетное действие:")
 
     keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
-    keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close")])
+
+    # Пакетные кнопки альбома
+    batch_row = []
+    if n_plain > 0:
+        batch_row.append(InlineKeyboardButton(f"🪄 Выровнять ИИ ({n_plain})", callback_data="lyrics:albai"))
+    if n_missing > 0:
+        batch_row.append(InlineKeyboardButton(f"🌐 Найти ({n_missing})", callback_data="lyrics:albmiss"))
+    if batch_row:
+        keyboard.append(batch_row)
+
+    keyboard.append([
+        InlineKeyboardButton("📁 К альбомам", callback_data="lyrics:alb_list"),
+        InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close"),
+    ])
 
     return "\n".join(lines), keyboard
 
@@ -992,15 +1017,21 @@ def _render_track_lyrics_card(track_path: Path, track_idx: int) -> tuple[str, li
         f"📝 *Превью текста:*\n```\n{preview}\n```"
     )
 
+    action_row = [
+        InlineKeyboardButton("🪄 AI-Синхронизация", callback_data=f"lyrics:ai:{track_idx}"),
+        InlineKeyboardButton("✏️ Свой текст", callback_data=f"lyrics:man:{track_idx}"),
+    ]
+
     keyboard = [
         [
             InlineKeyboardButton("🔍 LRCLIB", callback_data=f"lyrics:src:lrclib:{track_idx}"),
-            InlineKeyboardButton("🔍 SyncedLyrics", callback_data=f"lyrics:src:syncedlyrics:{track_idx}"),
+            InlineKeyboardButton("🔍 LRCMUX", callback_data=f"lyrics:src:lrcmux:{track_idx}"),
             InlineKeyboardButton("🔍 Genius", callback_data=f"lyrics:src:genius:{track_idx}"),
         ],
         [
-            InlineKeyboardButton("✏️ Прислать свой текст / .lrc", callback_data=f"lyrics:man:{track_idx}"),
+            InlineKeyboardButton("🔍 SyncedLyrics", callback_data=f"lyrics:src:syncedlyrics:{track_idx}"),
         ],
+        action_row,
         [
             InlineKeyboardButton("⬅️ К списку треков", callback_data="lyrics:back"),
             InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close"),
@@ -1009,9 +1040,71 @@ def _render_track_lyrics_card(track_path: Path, track_idx: int) -> tuple[str, li
     return text, keyboard
 
 
+def _render_albums_menu(matches: list[Path]) -> tuple[str, list[list[InlineKeyboardButton]]]:
+    """Формирует меню выбора альбома для настройки текстов."""
+    lines = [f"📝 *Выбери альбом для настройки текстов ({len(matches)}):*\n"]
+    buttons = []
+    for i, d in enumerate(matches):
+        artist, album = album_info(d)
+        display = f"{artist} — {album}" if album else d.name
+        lines.append(f"{i + 1}. `{d.name}` — {display}")
+        buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"lyrics:alb:{i}"))
+
+    keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
+    keyboard.append([InlineKeyboardButton("📊 Аудит текстов библиотеки", callback_data="lyrics:audit")])
+    keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close")])
+    return "\n".join(lines), keyboard
+
+
+def _render_lyrics_audit_view(audit_data: dict) -> tuple[str, list[list[InlineKeyboardButton]]]:
+    """Формирует дашборд аудита текстов по всей библиотеке."""
+    total = audit_data.get("total", 0)
+    synced = audit_data.get("synced", [])
+    plain = audit_data.get("plain", [])
+    missing = audit_data.get("missing", [])
+    albums_plain = audit_data.get("albums_plain", {})
+
+    pct_synced = int((len(synced) / total) * 100) if total else 0
+    pct_plain = int((len(plain) / total) * 100) if total else 0
+    pct_missing = int((len(missing) / total) * 100) if total else 0
+
+    lines = [
+        "📊 *Аудит текстов библиотеки Navidrome:*\n",
+        f"🎵 Всего FLAC-треков: *{total}*",
+        f"🎤 Синхронизировано: *{len(synced)}* ({pct_synced}%)",
+        f"📄 Обычный текст: *{len(plain)}* ({pct_plain}%)",
+        f"❌ Без текста: *{len(missing)}* ({pct_missing}%)\n",
+    ]
+
+    if plain:
+        lines.append(f"✨ Готовы к мгновенному AI-выравниванию: *{len(plain)}* треков в *{len(albums_plain)}* альбомах.")
+    elif missing:
+        lines.append("💡 Для треков без текста можно запустить сетевой поиск и автовыравнивание.")
+    else:
+        lines.append("🎉 Все треки библиотеки имеют синхронизированный текст!")
+
+    keyboard = []
+    if plain:
+        keyboard.append([
+            InlineKeyboardButton(f"🪄 Выровнять обычные тексты ИИ ({len(plain)})", callback_data="lyrics:libai:plain")
+        ])
+    if missing:
+        keyboard.append([
+            InlineKeyboardButton(f"🌐 Найти и выровнять недостающие ({len(missing)})", callback_data="lyrics:libai:missing")
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton("🔄 Обновить", callback_data="lyrics:audit"),
+        InlineKeyboardButton("📁 К альбомам", callback_data="lyrics:alb_list"),
+        InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close"),
+    ])
+
+    return "\n".join(lines), keyboard
+
+
 @_owner_only
 async def cmd_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда /lyrics [запрос] — просмотр и настройка текстов песен в Library."""
+    """Команда /lyrics [запрос|audit] — просмотр и настройка текстов песен в Library."""
     if not LIBRARY.exists():
         msg = await update.message.reply_text(f"❌ Папка {LIBRARY.name} не найдена.", parse_mode="Markdown")
         delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
@@ -1019,6 +1112,19 @@ async def cmd_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     query_str = " ".join(ctx.args).strip() if ctx.args else ""
+
+    if query_str.lower() in ("audit", "аудит", "stats", "статус"):
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        status_msg = await update.message.reply_text("⏳ Анализирую тексты в библиотеке...", parse_mode="Markdown")
+        loop = asyncio.get_running_loop()
+        audit_data = await loop.run_in_executor(None, lambda: audit_library_lyrics(LIBRARY))
+        ctx.bot_data["lyrics_audit_data"] = audit_data
+        text, keyboard = _render_lyrics_audit_view(audit_data)
+        await status_msg.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
 
     all_albums = sorted([
         d for d in LIBRARY.iterdir()
@@ -1056,22 +1162,11 @@ async def cmd_lyrics(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # Если несколько альбомов — выводим список с кнопками
-    lines = [f"📝 *Выбери альбом для настройки текстов ({len(matches)}):*\n"]
-    buttons = []
-    for i, d in enumerate(matches):
-        artist, album = album_info(d)
-        display = f"{artist} — {album}" if album else d.name
-        lines.append(f"{i + 1}. `{d.name}` — {display}")
-        buttons.append(InlineKeyboardButton(str(i + 1), callback_data=f"lyrics:alb:{i}"))
-
     ctx.bot_data["lyrics_albums"] = matches
     ctx.bot_data["lyrics_cmd_msg_id"] = update.message.message_id
-    keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
-    keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close")])
-
+    text, keyboard = _render_albums_menu(matches)
     await update.message.reply_text(
-        "\n".join(lines),
+        text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -1664,7 +1759,7 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик кнопок управления текстами."""
+    """Обработчик кнопок управления текстами и нейросетевой синхронизацией."""
     query = update.callback_query
     if update.effective_user.id != OWNER_ID:
         await query.answer()
@@ -1673,8 +1768,7 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     parts = query.data.split(":")
     action = parts[1]
 
-    # Для action == "src" не вызываем query.answer() сразу, чтобы показать результат
-    if action != "src":
+    if action not in ("src", "ai", "albai", "albmiss", "libai"):
         await query.answer()
 
     if action == "close":
@@ -1688,6 +1782,27 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                 await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=cmd_id)
             except Exception:
                 pass
+        return
+
+    if action == "audit":
+        status_text = "⏳ Анализирую тексты по всей библиотеке..."
+        await _safe_edit_message(query, status_text)
+        loop = asyncio.get_running_loop()
+        audit_data = await loop.run_in_executor(None, lambda: audit_library_lyrics(LIBRARY))
+        ctx.bot_data["lyrics_audit_data"] = audit_data
+        text, keyboard = _render_lyrics_audit_view(audit_data)
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if action == "alb_list":
+        all_albums = sorted([
+            d for d in LIBRARY.iterdir()
+            if d.is_dir() and any(f.suffix.lower() == ".flac" for f in d.iterdir() if f.is_file())
+        ])
+        matches = all_albums[-10:]
+        ctx.bot_data["lyrics_albums"] = matches
+        text, keyboard = _render_albums_menu(matches)
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if action == "album":
@@ -1776,7 +1891,7 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         except Exception:
             artist, title, album, duration = "", track_path.stem, "", 0
 
-        source_names = {"lrclib": "LRCLIB", "syncedlyrics": "SyncedLyrics", "genius": "Genius"}
+        source_names = {"lrclib": "LRCLIB", "lrcmux": "LRCMUX", "syncedlyrics": "SyncedLyrics", "genius": "Genius"}
         src_name = source_names.get(source, source)
 
         lm = LyricManager()
@@ -1807,6 +1922,324 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
         text, keyboard = _render_track_lyrics_card(track_path, idx)
         await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if action == "ai":
+        idx = int(parts[2])
+        tracks = ctx.bot_data.get("lyrics_tracks", [])
+        if not (0 <= idx < len(tracks)):
+            await query.answer()
+            return
+
+        track_path = tracks[idx]
+        await query.answer("🪄 Слушаю аудио и расставляю таймкоды...")
+
+        loading_text = (
+            f"🪄 *AI-Синхронизация в процессе...*\n\n"
+            f"🎵 Трек: `{track_path.name}`\n"
+            f"_Нейросеть faster-whisper сопоставляет аудио с текстом (1-3 сек)..._"
+        )
+        await _safe_edit_message(query, loading_text)
+
+        lm = LyricManager()
+        loop = asyncio.get_running_loop()
+        res, msg = await loop.run_in_executor(None, lambda: lm.ai_align_track(track_path))
+
+        text, keyboard = _render_track_lyrics_card(track_path, idx)
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+        if res and res.is_synced:
+            alert = await ctx.bot.send_message(chat_id=OWNER_ID, text=f"✨ {msg} (`{track_path.name}`)")
+        else:
+            alert = await ctx.bot.send_message(chat_id=OWNER_ID, text=f"⚠️ {msg}")
+        delete_later(ctx.bot, OWNER_ID, alert.message_id, delay=3.5)
+        return
+
+    if action == "albai":
+        album_dir = ctx.bot_data.get("lyrics_album_path")
+        tracks = ctx.bot_data.get("lyrics_tracks", [])
+        if not album_dir or not tracks:
+            await query.answer("⚠️ Сессия устарела. Используй /lyrics.")
+            return
+
+        # Находим треки с обычным текстом (.lrc без таймкодов)
+        target_tracks = []
+        for t in tracks:
+            lrc = t.with_suffix(".lrc")
+            if lrc.exists():
+                try:
+                    c = lrc.read_text(encoding="utf-8")
+                    if not has_timestamps(c) and c.strip():
+                        target_tracks.append(t)
+                except Exception:
+                    pass
+
+        if not target_tracks:
+            await query.answer("ℹ️ В этом альбоме нет обычных текстов для выравнивания.", show_alert=True)
+            return
+
+        await query.answer("🪄 Начинаю AI-выравнивание альбома...")
+        ctx.bot_data["lyrics_batch_cancel"] = False
+        loop = asyncio.get_running_loop()
+        last_edit_time = 0.0
+
+        def _on_albai_progress(cur: int, tot: int, tr_name: str):
+            nonlocal last_edit_time
+            now = time.time()
+            if now - last_edit_time > 1.8 or cur == tot:
+                last_edit_time = now
+                pct = int((cur / tot) * 100)
+                txt = (
+                    f"⏳ *AI-выравнивание альбома: {cur}/{tot} ({pct}%)*\n\n"
+                    f"🎵 Трек: `{tr_name}`\n"
+                    f"_Обработка ~1.3 сек на трек на CPU..._"
+                )
+                kb = [[InlineKeyboardButton("⏹️ Остановить", callback_data="lyrics:stop_batch")]]
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        _safe_edit_message(query, txt, reply_markup=InlineKeyboardMarkup(kb)),
+                        loop,
+                    )
+                except Exception:
+                    pass
+
+        def _run_albai():
+            import gc
+            from faster_whisper import WhisperModel
+            lm = LyricManager()
+            model = None
+            success = 0
+            try:
+                model = WhisperModel("tiny", device="cpu", compute_type="int8")
+                for i, tr in enumerate(target_tracks):
+                    if ctx.bot_data.get("lyrics_batch_cancel"):
+                        break
+                    _on_albai_progress(i + 1, len(target_tracks), tr.name)
+                    res, _ = lm.ai_align_track(tr, model=model)
+                    if res and res.is_synced:
+                        success += 1
+            except Exception as e:
+                log.error("Ошибка при пакетном albai: %s", e)
+            finally:
+                if model is not None:
+                    del model
+                    gc.collect()
+            return success
+
+        success_count = await loop.run_in_executor(None, _run_albai)
+
+        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks)
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+        conf = await ctx.bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"✨ Выровнено нейросетью: {success_count} из {len(target_tracks)} треков альбома!",
+        )
+        delete_later(ctx.bot, OWNER_ID, conf.message_id, delay=4.0)
+        return
+
+    if action == "albmiss":
+        album_dir = ctx.bot_data.get("lyrics_album_path")
+        tracks = ctx.bot_data.get("lyrics_tracks", [])
+        if not album_dir or not tracks:
+            await query.answer("⚠️ Сессия устарела. Используй /lyrics.")
+            return
+
+        missing_tracks = [t for t in tracks if not t.with_suffix(".lrc").exists()]
+        if not missing_tracks:
+            await query.answer("ℹ️ В этом альбоме у всех треков уже есть тексты.", show_alert=True)
+            return
+
+        await query.answer("🌐 Начинаю поиск недостающих текстов...")
+        ctx.bot_data["lyrics_batch_cancel"] = False
+        loop = asyncio.get_running_loop()
+        last_edit_time = 0.0
+
+        def _on_albmiss_progress(cur: int, tot: int, tr_name: str):
+            nonlocal last_edit_time
+            now = time.time()
+            if now - last_edit_time > 1.8 or cur == tot:
+                last_edit_time = now
+                pct = int((cur / tot) * 100)
+                txt = (
+                    f"⏳ *Поиск недостающих текстов: {cur}/{tot} ({pct}%)*\n\n"
+                    f"🎵 Трек: `{tr_name}`\n"
+                    f"_Поиск в LRCLIB, LRCMUX, SyncedLyrics, Genius..._"
+                )
+                kb = [[InlineKeyboardButton("⏹️ Остановить", callback_data="lyrics:stop_batch")]]
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        _safe_edit_message(query, txt, reply_markup=InlineKeyboardMarkup(kb)),
+                        loop,
+                    )
+                except Exception:
+                    pass
+
+        def _run_albmiss():
+            lm = LyricManager()
+            found = 0
+            for i, tr in enumerate(missing_tracks):
+                if ctx.bot_data.get("lyrics_batch_cancel"):
+                    break
+                _on_albmiss_progress(i + 1, len(missing_tracks), tr.name)
+                try:
+                    audio = FLAC(str(tr))
+                    artist = audio.get("artist", audio.get("albumartist", [""]))[0]
+                    title = audio.get("title", [""])[0]
+                    album = audio.get("album", [""])[0]
+                    dur = int(audio.info.length) if hasattr(audio.info, "length") else 0
+                except Exception:
+                    artist, title, album, dur = "", tr.stem, "", 0
+
+                res = lm.find_lyrics(artist, title, album, dur)
+                if res and res.text:
+                    tr.with_suffix(".lrc").write_text(res.text, encoding="utf-8")
+                    found += 1
+            return found
+
+        found_count = await loop.run_in_executor(None, _run_albmiss)
+
+        text, keyboard = _render_album_lyrics_tracklist(album_dir, tracks)
+        await _safe_edit_message(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+        conf = await ctx.bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"🌐 Найдено текстов онлайн: {found_count} из {len(missing_tracks)}!",
+        )
+        delete_later(ctx.bot, OWNER_ID, conf.message_id, delay=4.0)
+        return
+
+    if action == "stop_batch":
+        ctx.bot_data["lyrics_batch_cancel"] = True
+        await query.answer("Останавливаю процесс…", show_alert=True)
+        return
+
+    if action == "libai":
+        subaction = parts[2]
+        if subaction == "stop":
+            ctx.bot_data["lyrics_libai_cancel"] = True
+            await query.answer("Останавливаю выравнивание библиотеки…", show_alert=True)
+            return
+
+        if ctx.bot_data.get("lyrics_libai_running"):
+            await query.answer("Операция уже выполняется!", show_alert=True)
+            return
+
+        await query.answer()
+
+        loop = asyncio.get_running_loop()
+        audit_data = await loop.run_in_executor(None, lambda: audit_library_lyrics(LIBRARY))
+        target_tracks = audit_data.get("plain", []) if subaction == "plain" else audit_data.get("missing", [])
+
+        if not target_tracks:
+            txt = "ℹ️ Нет треков с обычным текстом для выравнивания." if subaction == "plain" else "ℹ️ Нет треков без текста."
+            await query.answer(txt, show_alert=True)
+            return
+
+        ctx.bot_data["lyrics_libai_running"] = True
+        ctx.bot_data["lyrics_libai_cancel"] = False
+        last_edit_time = 0.0
+
+        def _on_libai_progress(cur: int, tot: int, artist_title: str, alb: str, success: int, fail: int):
+            nonlocal last_edit_time
+            now = time.time()
+            if now - last_edit_time > 2.0 or cur == tot:
+                last_edit_time = now
+                pct = int((cur / tot) * 100)
+                txt = (
+                    f"⏳ *AI-выравнивание библиотеки: {cur}/{tot} ({pct}%)*\n\n"
+                    f"🎵 Трек: *{artist_title}*\n"
+                    f"💿 Альбом: `{alb}`\n"
+                    f"✨ Выровнено: *{success}* | ⚠️ Пропущено: *{fail}*\n\n"
+                    f"_Скорость: ~1-2 сек/трек на CPU. Для отмены нажми кнопку ниже:_"
+                )
+                kb = [[InlineKeyboardButton("⏹️ Остановить", callback_data="lyrics:libai:stop")]]
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        _safe_edit_message(query, txt, reply_markup=InlineKeyboardMarkup(kb)),
+                        loop,
+                    )
+                except Exception:
+                    pass
+
+        def _run_libai():
+            import gc
+            from faster_whisper import WhisperModel
+            lm = LyricManager()
+            model = None
+            success = 0
+            failed = 0
+            try:
+                model = WhisperModel("tiny", device="cpu", compute_type="int8")
+                for i, tr in enumerate(target_tracks):
+                    if ctx.bot_data.get("lyrics_libai_cancel"):
+                        break
+
+                    try:
+                        audio = FLAC(str(tr))
+                        artist = audio.get("artist", audio.get("albumartist", [""]))[0]
+                        title = audio.get("title", [""])[0]
+                        alb = audio.get("album", [""])[0] or tr.parent.name
+                    except Exception:
+                        artist, title, alb = "", tr.stem, tr.parent.name
+                    at_str = f"{artist} — {title}" if artist else title
+
+                    _on_libai_progress(i + 1, len(target_tracks), at_str, alb, success, failed)
+
+                    if subaction == "plain":
+                        res, _ = lm.ai_align_track(tr, model=model)
+                        if res and res.is_synced:
+                            success += 1
+                        else:
+                            failed += 1
+                    else:  # missing
+                        dur = int(audio.info.length) if hasattr(audio.info, "length") else 0
+                        res = lm.find_lyrics(artist, title, alb, dur)
+                        if res and res.text:
+                            if res.is_synced:
+                                tr.with_suffix(".lrc").write_text(res.text, encoding="utf-8")
+                                success += 1
+                            else:
+                                tr.with_suffix(".lrc").write_text(res.text, encoding="utf-8")
+                                ai_res, _ = lm.ai_align_track(tr, model=model)
+                                if ai_res and ai_res.is_synced:
+                                    success += 1
+                                else:
+                                    failed += 1
+                        else:
+                            failed += 1
+            except Exception as e:
+                log.error("Ошибка при libai: %s", e)
+            finally:
+                if model is not None:
+                    del model
+                    gc.collect()
+            return success, failed
+
+        try:
+            success, failed = await loop.run_in_executor(None, _run_libai)
+        finally:
+            ctx.bot_data["lyrics_libai_running"] = False
+
+        # Обновляем аудит
+        audit_data = await loop.run_in_executor(None, lambda: audit_library_lyrics(LIBRARY))
+        ctx.bot_data["lyrics_audit_data"] = audit_data
+
+        was_cancelled = ctx.bot_data.pop("lyrics_libai_cancel", False)
+        status_word = "остановлено" if was_cancelled else "завершено"
+
+        res_text = (
+            f"✅ *AI-выравнивание библиотеки {status_word}!*\n\n"
+            f"✨ Успешно синхронизировано: *{success}*\n"
+            f"⚠️ Пропущено / не удалось: *{failed}*\n"
+            f"📊 Всего в очереди было: *{len(target_tracks)}*"
+        )
+        kb = [
+            [InlineKeyboardButton("📊 К аудиту библиотеки", callback_data="lyrics:audit")],
+            [InlineKeyboardButton("📁 К альбомам", callback_data="lyrics:alb_list")],
+            [InlineKeyboardButton("❌ Закрыть", callback_data="lyrics:close")],
+        ]
+        await _safe_edit_message(query, res_text, reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if action == "man":

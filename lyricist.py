@@ -221,7 +221,67 @@ class LyricManager:
 
         return None
 
-    # ── 3. SyncedLyrics (NetEase, Megalobiz, Musixmatch) ─────────────────────
+    # ── 3. LRCMUX (KuGou, Musixmatch, NetEase, YouTube Music) ─────────────────
+
+    def _fetch_lrcmux(
+        self,
+        artist: str,
+        title: str,
+        album: str = "",
+        duration: int = 0,
+    ) -> LyricResult | None:
+        """Ищет синхронизированный текст через мультиплексор lrcmux (KuGou, Musixmatch, NetEase, YTMusic)."""
+        artist_clean = artist.strip()
+        title_clean = title.strip()
+        if not artist_clean or not title_clean:
+            return None
+
+        params = {"artist": artist_clean, "title": title_clean}
+        if album.strip():
+            params["album"] = album.strip()
+        if duration > 0:
+            params["duration"] = str(duration)
+
+        try:
+            r = requests.get(
+                "https://api.lrcmux.dev/get",
+                params=params,
+                headers={"User-Agent": self.BROWSER_UA},
+                timeout=6,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                lines = data.get("lines", [])
+                if lines:
+                    out = []
+                    has_sync = False
+                    for line in lines:
+                        txt = line.get("text", "").strip()
+                        start_ms = line.get("start")
+                        if start_ms is not None:
+                            has_sync = True
+                            total_sec = max(0.0, start_ms / 1000.0)
+                            m = int(total_sec // 60)
+                            s = total_sec % 60
+                            out.append(f"[{m:02d}:{s:05.2f}] {txt}")
+                        elif txt:
+                            out.append(txt)
+
+                    full_text = "\n".join(out).strip()
+                    if full_text:
+                        return LyricResult(
+                            text=full_text,
+                            is_synced=has_sync,
+                            source="lrcmux",
+                            track_title=title,
+                            artist=artist,
+                        )
+        except Exception as e:
+            log.debug("lrcmux fetch error for '%s — %s': %s", artist, title, e)
+
+        return None
+
+    # ── 4. SyncedLyrics (NetEase, Megalobiz, Musixmatch) ─────────────────────
 
     def _fetch_syncedlyrics(self, artist: str, title: str) -> LyricResult | None:
         """Ищет синхронизированный караоке-текст через провайдеры syncedlyrics."""
@@ -270,6 +330,8 @@ class LyricManager:
         if preferred_source == "lrclib":
             synced, plain = self._fetch_lrclib(artist, title, album, duration)
             return synced or plain
+        if preferred_source == "lrcmux":
+            return self._fetch_lrcmux(artist, title, album, duration)
         if preferred_source == "syncedlyrics":
             return self._fetch_syncedlyrics(artist, title)
         if preferred_source == "genius":
@@ -282,18 +344,29 @@ class LyricManager:
             log.info("  ✓ Найдено караоке [LRCLIB]: %s — %s", artist, title)
             return lrclib_synced
 
-        # Фаза 2: Синхронизированный текст через мульти-провайдер syncedlyrics (NetEase, Megalobiz, Musixmatch)
+        # Фаза 2: Синхронизированный текст через мультиплексор lrcmux (KuGou, Musixmatch, NetEase, YouTube Music)
+        lrcmux_res = self._fetch_lrcmux(artist, title, album, duration)
+        if lrcmux_res and lrcmux_res.is_synced:
+            log.info("  ✓ Найдено караоке [lrcmux]: %s — %s", artist, title)
+            return lrcmux_res
+
+        # Фаза 3: Синхронизированный текст через мульти-провайдер syncedlyrics
         synced_res = self._fetch_syncedlyrics(artist, title)
         if synced_res and synced_res.is_synced:
             log.info("  ✓ Найдено караоке [SyncedLyrics]: %s — %s", artist, title)
             return synced_res
 
-        # Фаза 3: Обычный текст (Plain) — из первого запроса LRCLIB
+        # Фаза 4: Обычный текст (Plain) — из первого запроса LRCLIB
         if lrclib_plain:
             log.info("  ✓ Найден текст [LRCLIB]: %s — %s", artist, title)
             return lrclib_plain
 
-        # Фаза 4: Эталонный plain-текст с Genius
+        # Фаза 5: Обычный текст из lrcmux (если не было синхронизации)
+        if lrcmux_res and lrcmux_res.text:
+            log.info("  ✓ Найден текст [lrcmux]: %s — %s", artist, title)
+            return lrcmux_res
+
+        # Фаза 6: Эталонный plain-текст с Genius
         genius_plain = self._fetch_genius(artist, title)
         if genius_plain:
             log.info("  ✓ Найден текст [Genius]: %s — %s", artist, title)
@@ -338,6 +411,7 @@ class LyricManager:
                 lrc_path.write_text(res.text, encoding="utf-8")
                 source_labels = {
                     "lrclib": "LRCLIB",
+                    "lrcmux": "LRCMUX",
                     "syncedlyrics": "SyncedLyrics",
                     "genius": "Genius",
                     "manual": "Вручную",
@@ -353,9 +427,124 @@ class LyricManager:
             log.error("Ошибка при обработке текста для %s: %s", path.name, e)
             return f"Ошибка: {e}"
 
+    def ai_align_track(self, flac_path: str | Path, model: any = None) -> tuple[LyricResult | None, str]:
+        """Выполняет нейро-выравнивание текста по аудиофайлу трека (Forced Alignment).
+
+        1. Берёт существующий plain-текст из .lrc (если он уже скачан с Genius).
+        2. Если текста нет, скачивает plain-текст через водопад (Genius / lrcmux).
+        3. Запускает align_lyrics() для расстановки таймкодов.
+        4. Сохраняет обновлённый синхронизированный .lrc файл.
+
+        Returns:
+            (LyricResult, "Сообщение о статусе")
+        """
+        path = Path(flac_path)
+        if not path.exists() or path.suffix.lower() != ".flac":
+            return None, "Файл не найден или не является FLAC"
+
+        lrc_path = path.with_suffix(".lrc")
+        plain_text = ""
+
+        # 1. Проверяем существующий файл .lrc
+        if lrc_path.exists():
+            try:
+                content = lrc_path.read_text(encoding="utf-8").strip()
+                # Если уже есть таймкоды — очищаем их, чтобы получить чистый текст для выравнивания
+                lines = []
+                for l in content.split("\n"):
+                    cleaned = re.sub(r"\[\d{2}:\d{2}\.\d+\]\s*", "", l).strip()
+                    if cleaned:
+                        lines.append(cleaned)
+                plain_text = "\n".join(lines)
+            except Exception as e:
+                log.debug("Ошибка чтения lrc %s: %s", lrc_path, e)
+
+        # 2. Если текста не было, скачиваем с Genius/водопада
+        if not plain_text:
+            try:
+                audio = FLAC(str(path))
+                artist = audio.get("artist", audio.get("albumartist", [""]))[0]
+                title = audio.get("title", [""])[0]
+                if artist and title:
+                    res = self._fetch_genius(artist, title) or self._fetch_lrcmux(artist, title)
+                    if res and res.text:
+                        plain_text = res.text
+            except Exception as e:
+                log.debug("Ошибка получения тегов трека %s: %s", path, e)
+
+        if not plain_text.strip():
+            return None, "Текст песни не найден ни в файле, ни на Genius"
+
+        # 3. Выравнивание через faster-whisper
+        try:
+            from aligner import align_lyrics
+            synced_text = align_lyrics(path, plain_text, model=model)
+            if synced_text and has_timestamps(synced_text):
+                lrc_path.write_text(synced_text, encoding="utf-8")
+                res = LyricResult(
+                    text=synced_text,
+                    is_synced=True,
+                    source="ai",
+                    track_title=path.stem,
+                )
+                return res, "Таймкоды успешно расставлены нейросетью ✨"
+            return None, "Нейросети не удалось распознать слова в аудио"
+        except Exception as e:
+            log.error("Ошибка при AI-выравнивании %s: %s", path.name, e)
+            return None, f"Ошибка нейросети: {e}"
+
     def save_manual_lyrics(self, lrc_path: Path, text: str) -> LyricResult:
         """Сохраняет вручную введённый текст в файл .lrc."""
         text = text.strip()
         is_sync = has_timestamps(text)
         lrc_path.write_text(text, encoding="utf-8")
         return LyricResult(text=text, is_synced=is_sync, source="manual")
+
+
+def audit_library_lyrics(library_dir: str | Path) -> dict:
+    """Аудит наличия и синхронизации текстов песен по всей музыкальной библиотеке.
+
+    Returns:
+        Словарь с ключами:
+        - total: общее число FLAC треков
+        - synced: список Path треков с синхронизированным .lrc
+        - plain: список Path треков с обычным текстом .lrc (готовы к AI-выравниванию)
+        - missing: список Path треков без .lrc
+        - albums_plain: словарь {album_dir_name: [Path, ...]} для удобного пакетного выравнивания
+    """
+    root = Path(library_dir)
+    if not root.exists():
+        return {"total": 0, "synced": [], "plain": [], "missing": [], "albums_plain": {}}
+
+    flac_files = sorted(root.rglob("*.flac"))
+    synced: list[Path] = []
+    plain: list[Path] = []
+    missing: list[Path] = []
+    albums_plain: dict[str, list[Path]] = {}
+
+    for flac in flac_files:
+        lrc = flac.with_suffix(".lrc")
+        if not lrc.exists():
+            missing.append(flac)
+            continue
+
+        try:
+            content = lrc.read_text(encoding="utf-8", errors="ignore")
+            if has_timestamps(content):
+                synced.append(flac)
+            elif content.strip():
+                plain.append(flac)
+                alb_name = flac.parent.name
+                albums_plain.setdefault(alb_name, []).append(flac)
+            else:
+                missing.append(flac)
+        except Exception:
+            missing.append(flac)
+
+    return {
+        "total": len(flac_files),
+        "synced": synced,
+        "plain": plain,
+        "missing": missing,
+        "albums_plain": albums_plain,
+    }
