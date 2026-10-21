@@ -459,14 +459,23 @@ def upgrade_album(
     album_dir: Path,
     db_path: str | Path = "navidrome.db",
     force_cover: bool = False,
+    force_lyrics: bool = False,
+    force_replaygain: bool = False,
+    force: bool = False,
 ) -> dict:
     """Выполняет полную стандартизацию («идеализацию») альбома на месте.
 
     1. Очищает и нормализует теги всех треков (FLACSurgeon + TagSanitizer).
-    2. Проверяет обложку: если её нет (или force_cover=True), ищет и вшивает.
+    2. Проверяет обложку: если её нет (или force_cover/force=True), ищет и вшивает.
     3. Переименовывает треки в '01. Title.flac' и ищет синхронизированные тексты (.lrc).
     4. Приводит имя папки релиза к 'Artist - Album'.
+    5. Рассчитывает ReplayGain (потрековый и альбомный).
     """
+    if force:
+        force_cover = True
+        force_lyrics = True
+        force_replaygain = True
+
     flac_files = sorted(album_dir.rglob("*.flac"))
     if not flac_files:
         return {"error": "no_flacs", "folder": album_dir.name}
@@ -499,15 +508,14 @@ def upgrade_album(
             except Exception as e:
                 log.warning("Не удалось найти обложку для %s — %s: %s", artist, album, e)
 
-    # Шаг 3: Переименование треков и подгрузка недостающих текстов песен (.lrc)
+    # Шаг 3: Переименование треков и подгрузка текстов песен (.lrc)
     flac_files = sorted(album_dir.rglob("*.flac"))
     for flac in flac_files:
         try:
             new_flac = renamer.rename_file(str(flac))
-            lrc_path = Path(new_flac).with_suffix(".lrc")
-            if not lrc_path.exists():
-                res_status = lyricist.process_file(new_flac)
-                if any(k in res_status for k in ("Синхронизированный", "Обычный текст", "LRCLIB", "SyncedLyrics", "Genius")):
+            res_status = lyricist.process_file(new_flac, overwrite=force_lyrics, smart_upgrade=True)
+            if any(k in res_status for k in ("Синхронизированный", "Обычный текст", "LRCLIB", "SyncedLyrics", "Genius", "Обновлено")):
+                if "Уже есть" not in res_status and "Сохранено" not in res_status:
                     lyrics_added += 1
         except Exception as e:
             log.warning("Ошибка обработки трека %s: %s", flac.name, e)
@@ -519,7 +527,7 @@ def upgrade_album(
     # Шаг 5: Проверка и расчёт ReplayGain
     from replaygain import album_has_replaygain, apply_replaygain
     replaygain_added = False
-    if not album_has_replaygain(new_folder):
+    if force_replaygain or not album_has_replaygain(new_folder):
         rg_ok, _ = apply_replaygain(new_folder)
         replaygain_added = rg_ok
 
@@ -539,6 +547,7 @@ def upgrade_library(
     db_path: str | Path = "navidrome.db",
     progress_callback: Callable[[int, int, str, dict], None] | None = None,
     cancel_flag: Callable[[], bool] | None = None,
+    force: bool = False,
 ) -> dict:
     """Выполняет пакетную стандартизацию («идеализацию») всех альбомов в Library."""
     all_albums = sorted([
@@ -558,7 +567,7 @@ def upgrade_library(
             log.info("Идеализация библиотеки прервана пользователем")
             break
 
-        res = upgrade_album(album_folder, db_path=db_path)
+        res = upgrade_album(album_folder, db_path=db_path, force=force)
         processed += 1
         if res.get("cover_added"):
             total_covers += 1
@@ -579,5 +588,6 @@ def upgrade_library(
         "covers_added": total_covers,
         "lyrics_added": total_lyrics,
         "replaygain_added": total_rg,
+        "force": force,
         "results": results,
     }

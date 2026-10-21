@@ -806,17 +806,15 @@ async def cmd_upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         f"📁 Каталог: `{LIBRARY.name}`\n"
         f"💿 Альбомов для обработки: *{len(albums)}*\n\n"
-        "*Что будет выполнено автоматически:*\n"
-        "• Очистка от ID3-мусора и нормализация тегов\n"
-        "• Проверка обложек: сохранение текущих или поиск новых Hi-Res\n"
-        "• Загрузка недостающих синхронизированных текстов (.lrc)\n"
-        "• Приведение треков к формату '01. Title.flac' и папок к 'Artist - Album'\n\n"
-        "_Существующие качественные обложки не перезаписываются._"
+        "*Выбери режим идеализации библиотеки:*\n\n"
+        "• ▶️ *Обычный (мягкий)* — быстро заполнит только пропуски: найдет недостающие обложки, недостающие тексты и проставит ReplayGain. Существующие файлы не перезаписывает.\n\n"
+        "• ⚡ *Force (полная пересборка)* — с нуля очистит теги от мусора, перекачает Hi-Res обложки, обновит тексты (с защитой караоке от даунгрейда) и заново рассчитает ReplayGain для всей библиотеки."
     )
 
     keyboard = [
-        [InlineKeyboardButton("▶️ Начать идеализацию", callback_data="upgrade:start")],
-        [InlineKeyboardButton("❌ Закрыть", callback_data="upgrade:close")],
+        [InlineKeyboardButton("▶️ Обычный апгрейд", callback_data="upgrade:start:normal")],
+        [InlineKeyboardButton("⚡ Полная пересборка (Force)", callback_data="upgrade:start:force")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="upgrade:close")],
     ]
 
     await ctx.bot.send_message(
@@ -835,7 +833,8 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if update.effective_user.id != OWNER_ID:
         return
 
-    action = query.data.split(":")[1]
+    parts = query.data.split(":")
+    action = parts[1]
 
     if action == "close":
         try:
@@ -850,6 +849,9 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if action == "start":
+        mode = parts[2] if len(parts) > 2 else "normal"
+        is_force = (mode == "force")
+
         if ctx.bot_data.get("upgrade_running"):
             await query.answer("Идеализация уже выполняется!", show_alert=True)
             return
@@ -860,6 +862,8 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         last_edit_time = 0.0
         loop = asyncio.get_running_loop()
 
+        mode_badge = "⚡ FORCE" if is_force else "▶️ ОБЫЧНЫЙ"
+
         def _on_progress(cur: int, tot: int, alb_name: str, res: dict):
             nonlocal last_edit_time
             now = time.time()
@@ -868,7 +872,7 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                 pct = int((cur / tot) * 100)
                 rg_str = " | 🔊 RG: +" if res.get("replaygain_added") else ""
                 txt = (
-                    f"⏳ *Идеализация библиотеки: {cur}/{tot} ({pct}%)*\n\n"
+                    f"⏳ *Идеализация библиотеки [{mode_badge}]: {cur}/{tot} ({pct}%)*\n\n"
                     f"💿 Текущий: *{alb_name}*\n"
                     f"📝 Тексты: +{res.get('lyrics_added', 0)} | 🖼️ Обложка: {'+' if res.get('cover_added') else 'OK'}{rg_str}\n\n"
                     f"_Пожалуйста, подожди завершения…_"
@@ -885,7 +889,7 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         def _is_cancelled() -> bool:
             return bool(ctx.bot_data.get("upgrade_cancelled", False))
 
-        init_text = "⏳ *Идеализация библиотеки запущена…*\n\nАнализирую релизы…"
+        init_text = f"⏳ *Идеализация библиотеки [{mode_badge}] запущена…*\n\nАнализирую релизы…"
         init_kb = [[InlineKeyboardButton("⏹️ Остановить", callback_data="upgrade:stop")]]
         await _safe_edit_message(query, init_text, reply_markup=InlineKeyboardMarkup(init_kb))
 
@@ -897,6 +901,7 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                     db_path=DB_PATH,
                     progress_callback=_on_progress,
                     cancel_flag=_is_cancelled,
+                    force=is_force,
                 ),
             )
         finally:
@@ -905,9 +910,9 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         stopped_str = " (прервано пользователем)" if ctx.bot_data.get("upgrade_cancelled") else ""
         rg_added_str = f"\n🔊 ReplayGain рассчитан: *{summary.get('replaygain_added', 0)}* альбомов" if summary.get("replaygain_added") else ""
         final_text = (
-            f"✅ *Идеализация библиотеки завершена{stopped_str}!* 🎉\n\n"
+            f"✅ *Идеализация библиотеки [{mode_badge}] завершена{stopped_str}!* 🎉\n\n"
             f"💿 Обработано альбомов: *{summary['processed']}/{summary['total']}*\n"
-            f"🖼️ Добавлено обложек: *{summary['covers_added']}*\n"
+            f"🖼️ Добавлено/обновлено обложек: *{summary['covers_added']}*\n"
             f"📝 Загружено текстов (.lrc): *{summary['lyrics_added']}*"
             f"{rg_added_str}"
         )

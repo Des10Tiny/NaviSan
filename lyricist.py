@@ -377,8 +377,18 @@ class LyricManager:
 
     # ── Обработка файлов ──────────────────────────────────────────────────────
 
-    def process_file(self, filepath: str | Path, overwrite: bool = False) -> str:
+    def process_file(
+        self,
+        filepath: str | Path,
+        overwrite: bool = False,
+        smart_upgrade: bool = True,
+    ) -> str:
         """Скачивает текст по водопаду и сохраняет .lrc файл рядом с треком.
+
+        Args:
+            filepath: путь к FLAC файлу.
+            overwrite: если True, выполняет принудительный сетевой поиск и обновление.
+            smart_upgrade: если True, защищает существующее караоке (🎤) от даунгрейда до plain (📄).
 
         Returns:
             Строку-статус для отчёта:
@@ -389,11 +399,18 @@ class LyricManager:
             return "Не аудиофайл"
 
         lrc_path = path.with_suffix(".lrc")
-        if not overwrite and lrc_path.exists():
+        existing_has_sync = False
+        if lrc_path.exists():
             try:
                 content = lrc_path.read_text(encoding="utf-8")
-                return "Синхронизированный 🎤" if has_timestamps(content) else "Обычный текст 📄"
+                existing_has_sync = has_timestamps(content)
             except Exception:
+                pass
+
+            # Если перезапись выключена:
+            # - Если уже есть караоке -> пропускаем
+            # - Если есть обычный текст, но smart_upgrade=False -> пропускаем
+            if not overwrite and (existing_has_sync or not smart_upgrade):
                 return "Уже есть 📁"
 
         try:
@@ -408,6 +425,10 @@ class LyricManager:
 
             res = self.find_lyrics(artist, title, album, duration)
             if res and res.text:
+                # Защита от даунгрейда: если уже было караоке, а пришёл обычный текст — сохраняем караоке!
+                if existing_has_sync and not res.is_synced:
+                    return "Сохранено караоке 🎤 (в сети только обычный)"
+
                 lrc_path.write_text(res.text, encoding="utf-8")
                 source_labels = {
                     "lrclib": "LRCLIB",
@@ -418,9 +439,14 @@ class LyricManager:
                 }
                 source_label = source_labels.get(res.source, res.source.upper())
 
-                if res.is_synced:
-                    return f"Синхронизированный [{source_label}] 🎤"
-                return f"Обычный текст [{source_label}] 📄"
+                prefix = "Обновлено караоке" if existing_has_sync else ("Синхронизированный" if res.is_synced else "Обычный текст")
+                icon = "🎤" if res.is_synced else "📄"
+                return f"{prefix} [{source_label}] {icon}"
+
+            if existing_has_sync:
+                return "Сохранено караоке 🎤"
+            elif lrc_path.exists():
+                return "Обычный текст 📄"
 
             return "Не найдено ❌"
         except Exception as e:
