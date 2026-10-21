@@ -30,7 +30,7 @@ class FLACSurgeon:
         "title", "artist", "albumartist", "album",
         "date", "year", "originaldate", "tracknumber", "tracktotal",
         "discnumber", "disctotal", "genre", "label",
-        "rating", "compilation",
+        "rating", "compilation", "itunesadvisory",
         "replaygain_track_gain", "replaygain_track_peak",
         "replaygain_album_gain", "replaygain_album_peak",
         "replaygain_reference_loudness",
@@ -94,6 +94,27 @@ class FLACSurgeon:
                 if alt in audio:
                     audio["label"] = audio[alt]
                     break
+
+        # Нормализация тегов Explicit (EXPLICIT / ADVISORY -> ITUNESADVISORY)
+        if "itunesadvisory" not in audio:
+            for alt in ("explicit", "explicitlyrics", "explicit_lyrics", "advisory", "rating_advisory"):
+                if alt in audio:
+                    val = str(audio[alt][0]).strip().lower()
+                    if val in ("1", "true", "yes", "explicit", "e"):
+                        audio["itunesadvisory"] = ["1"]
+                    elif val in ("2", "clean", "c"):
+                        audio["itunesadvisory"] = ["2"]
+                    elif val in ("0", "false", "no", "none"):
+                        audio["itunesadvisory"] = ["0"]
+                    break
+        elif "itunesadvisory" in audio:
+            val = str(audio["itunesadvisory"][0]).strip().lower()
+            if val in ("1", "true", "yes", "explicit", "e"):
+                audio["itunesadvisory"] = ["1"]
+            elif val in ("2", "clean", "c"):
+                audio["itunesadvisory"] = ["2"]
+            elif val in ("0", "false", "no", "none"):
+                audio["itunesadvisory"] = ["0"]
 
         # 1. Фильтрация по whitelist тегов и очистка мусорных значений
         saved_tags: dict[str, list[str]] = {}

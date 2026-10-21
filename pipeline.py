@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 
+import httpx
 from mutagen.flac import FLAC
 
 from covers import CoverCandidate, download_cover, search_covers
@@ -172,6 +174,9 @@ def apply_pipeline(
         except Exception:
             pass
         report.append(f"• `{Path(new_path).name}`{track_artist_str} — {lrc_status}")
+
+    # Онлайн-проверка Explicit-статуса (ITUNESADVISORY) через Deezer/iTunes
+    enrich_album_explicit_tags(folder)
 
     # Переименовываем папку альбома последней (пути выше уже отработали).
     new_folder = Path(renamer.rename_album_folder(str(folder)))
@@ -506,6 +511,130 @@ def set_track_artists(track_path: Path, new_artists_str: str) -> list[str]:
     return artists_list
 
 
+# ── Определение Explicit (ITUNESADVISORY) ───────────────────────────────────
+
+def fetch_album_explicit_mapping(artist: str, album: str) -> dict[str, bool]:
+    """Ищет альбом в Deezer (с fallback на iTunes) и возвращает словарь {normalized_title: is_explicit}."""
+    if not artist or not album:
+        return {}
+
+    def norm(s: str) -> str:
+        return re.sub(r"[^\w]", "", s.lower())
+
+    # 1. Deezer API
+    queries = [f"{artist} {album}", album]
+    first_artist = artist.split(",")[0].split("&")[0].strip()
+    if first_artist and first_artist != artist:
+        queries.insert(1, f"{first_artist} {album}")
+
+    for q in queries:
+        try:
+            r = httpx.get(
+                "https://api.deezer.com/search/album",
+                params={"q": q},
+                timeout=4.0,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                if data:
+                    alb_id = data[0].get("id")
+                    alb_r = httpx.get(
+                        f"https://api.deezer.com/album/{alb_id}",
+                        timeout=4.0,
+                        headers={"User-Agent": "Mozilla/5.0"},
+                    )
+                    if alb_r.status_code == 200:
+                        tracks = alb_r.json().get("tracks", {}).get("data", [])
+                        m: dict[str, bool] = {}
+                        for tr in tracks:
+                            t_title = tr.get("title", "")
+                            t_short = tr.get("title_short", t_title)
+                            is_exp = bool(tr.get("explicit_lyrics"))
+                            m[norm(t_title)] = is_exp
+                            m[norm(t_short)] = is_exp
+                        if m:
+                            return m
+        except Exception as e:
+            log.debug("Ошибка запроса explicit из Deezer для '%s': %s", q, e)
+
+    # 2. iTunes API fallback
+    try:
+        r = httpx.get(
+            "https://itunes.apple.com/search",
+            params={"term": f"{artist} {album}", "entity": "album", "limit": 1},
+            timeout=4.0,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if r.status_code == 200:
+            res = r.json().get("results", [])
+            if res:
+                coll_id = res[0].get("collectionId")
+                r2 = httpx.get(
+                    "https://itunes.apple.com/lookup",
+                    params={"id": coll_id, "entity": "song"},
+                    timeout=4.0,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                if r2.status_code == 200:
+                    m = {}
+                    for tr in r2.json().get("results", []):
+                        if tr.get("wrapperType") == "track":
+                            t_title = tr.get("trackName", "")
+                            is_exp = (tr.get("trackExplicitness") == "explicit")
+                            m[norm(t_title)] = is_exp
+                    if m:
+                        return m
+    except Exception as e:
+        log.debug("Ошибка запроса explicit из iTunes для '%s — %s': %s", artist, album, e)
+
+    return {}
+
+
+def enrich_album_explicit_tags(folder: Path, force: bool = False) -> int:
+    """Определяет explicit-статус треков через онлайн-каталоги и проставляет ITUNESADVISORY."""
+    flac_files = sorted(folder.rglob("*.flac"))
+    if not flac_files:
+        return 0
+
+    artist, album = album_info(folder)
+    if not artist or not album:
+        return 0
+
+    mapping = fetch_album_explicit_mapping(artist, album)
+    if not mapping:
+        return 0
+
+    def norm(s: str) -> str:
+        return re.sub(r"[^\w]", "", s.lower())
+
+    marked_count = 0
+    for f in flac_files:
+        try:
+            audio = FLAC(str(f))
+            if not force and "itunesadvisory" in audio:
+                continue
+
+            title = audio.get("title", [f.stem])[0]
+            clean_t = re.sub(r"(?i)\s*[\(\[][^()\[\]]*(?:feat|ft)[^()\[\]]*[\)\]]", "", title).strip()
+
+            is_exp = mapping.get(norm(title)) or mapping.get(norm(clean_t))
+            if is_exp:
+                audio["itunesadvisory"] = ["1"]
+                audio.save()
+                marked_count += 1
+            elif is_exp is False and force:
+                audio["itunesadvisory"] = ["0"]
+                audio.save()
+        except Exception as e:
+            log.warning("Ошибка простановки explicit для %s: %s", f.name, e)
+
+    if marked_count > 0:
+        log.info("Проставлен тег ITUNESADVISORY (Explicit) для %d треков в %s", marked_count, folder.name)
+
+    return marked_count
+
+
 # ── Пакетная идеализация библиотеки ──────────────────────────────────────────
 
 def album_has_cover(album_dir: Path) -> bool:
@@ -593,6 +722,9 @@ def upgrade_album(
                     except Exception as e:
                         log.warning("Не удалось обновить ALBUMARTIST в %s: %s", f.name, e)
 
+    # Шаг 1.6: Онлайн-проверка Explicit-статуса через Deezer/iTunes (проставляем ITUNESADVISORY)
+    explicit_added = enrich_album_explicit_tags(album_dir, force=force)
+
     # Шаг 2: Теперь берём гарантированно чистые artist и album для поиска обложки
     artist, album = album_info(album_dir)
     if force_cover or not album_has_cover(album_dir):
@@ -637,6 +769,7 @@ def upgrade_album(
         "cover_added": cover_added,
         "lyrics_added": lyrics_added,
         "replaygain_added": replaygain_added,
+        "explicit_added": explicit_added,
     }
 
 
@@ -662,6 +795,7 @@ def upgrade_library(
     total_covers = 0
     total_lyrics = 0
     total_rg = 0
+    total_explicit = 0
     results = []
 
     for i, album_folder in enumerate(all_albums, 1):
@@ -676,6 +810,7 @@ def upgrade_library(
         total_lyrics += res.get("lyrics_added", 0)
         if res.get("replaygain_added"):
             total_rg += 1
+        total_explicit += res.get("explicit_added", 0)
         results.append(res)
 
         if progress_callback:
@@ -690,6 +825,7 @@ def upgrade_library(
         "covers_added": total_covers,
         "lyrics_added": total_lyrics,
         "replaygain_added": total_rg,
+        "explicit_added": total_explicit,
         "force": force,
         "results": results,
     }
