@@ -973,7 +973,8 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         def _on_progress(cur: int, tot: int, alb_name: str, res: dict):
             nonlocal last_edit_time
             now = time.time()
-            if now - last_edit_time > 2.0 or cur == tot:
+            # Промежуточный прогресс отправляем только для cur < tot, чтобы не конфликтовать с финальным сообщением
+            if cur < tot and (now - last_edit_time > 2.0):
                 last_edit_time = now
                 pct = int((cur / tot) * 100)
                 rg_str = " | 🔊 RG: +" if res.get("replaygain_added") else ""
@@ -1019,6 +1020,8 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
             ctx.bot_data["upgrade_running"] = False
             ctx.bot_data.pop("upgrade_target_albums", None)
 
+        await asyncio.sleep(0.5)
+
         stopped_str = " (прервано пользователем)" if ctx.bot_data.get("upgrade_cancelled") else ""
         rg_added_str = f"\n🔊 ReplayGain рассчитан: *{summary.get('replaygain_added', 0)}* альбомов" if summary.get("replaygain_added") else ""
         final_text = (
@@ -1033,14 +1036,23 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def _safe_edit_message(query, text: str, reply_markup=None, parse_mode="Markdown") -> None:
-    """Редактирует сообщение, безопасно игнорируя 'Message is not modified'."""
+    """Редактирует сообщение, безопасно игнорируя 'Message is not modified' и обрабатывая ограничения Telegram."""
+    from telegram.error import BadRequest, RetryAfter, TelegramError
     try:
         await query.edit_message_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
     except BadRequest as e:
         if "Message is not modified" in str(e):
             pass
         else:
-            raise
+            log.warning("BadRequest при редактировании сообщения: %s", e)
+    except RetryAfter as e:
+        await asyncio.sleep(e.retry_after + 0.5)
+        try:
+            await query.edit_message_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+        except Exception as e2:
+            log.warning("Ошибка повторного редактирования сообщения: %s", e2)
+    except TelegramError as e:
+        log.warning("TelegramError при редактировании сообщения: %s", e)
 
 
 # ── Настройка текстов песен (Lyrics UI) ───────────────────────────────────────

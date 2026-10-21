@@ -563,6 +563,36 @@ def upgrade_album(
         except Exception as e:
             log.warning("Ошибка очистки тегов в треке %s: %s", flac.name, e)
 
+    # Шаг 1.5: При force-режиме не доверяем рипперам: определяем артистов,
+    # которые присутствуют во всех 100% треков релиза, сортируем их по алфавиту
+    # и обновляем ALBUMARTIST в тегах всех файлов.
+    if force:
+        track_artists_sets = []
+        for f in flac_files:
+            try:
+                audio = FLAC(str(f))
+                arts = audio.get("artist", [])
+                if arts:
+                    track_artists_sets.append(set(arts))
+            except Exception:
+                pass
+
+        if track_artists_sets:
+            common = set.intersection(*track_artists_sets)
+            if common:
+                sorted_common = sorted(common, key=lambda s: s.casefold())
+                log.info(
+                    "Force upgrade: определены общие артисты релиза (по алфавиту): %s",
+                    sorted_common,
+                )
+                for f in flac_files:
+                    try:
+                        audio = FLAC(str(f))
+                        audio["albumartist"] = sorted_common
+                        audio.save()
+                    except Exception as e:
+                        log.warning("Не удалось обновить ALBUMARTIST в %s: %s", f.name, e)
+
     # Шаг 2: Теперь берём гарантированно чистые artist и album для поиска обложки
     artist, album = album_info(album_dir)
     if force_cover or not album_has_cover(album_dir):
@@ -589,7 +619,7 @@ def upgrade_album(
             log.warning("Ошибка обработки трека %s: %s", flac.name, e)
 
     # Шаг 4: Приведение имени папки к каноническому 'Artist - Album'
-    new_folder_str = renamer.rename_album_folder(str(album_dir))
+    new_folder_str = renamer.rename_album_folder(str(album_dir), force_common_artists=force)
     new_folder = Path(new_folder_str)
 
     # Шаг 5: Проверка и расчёт ReplayGain

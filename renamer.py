@@ -72,11 +72,15 @@ class FileSystemManager:
 
         return str(filepath)
 
-    def rename_album_folder(self, folder_path: str | Path) -> str:
+    def rename_album_folder(
+        self, folder_path: str | Path, force_common_artists: bool = False
+    ) -> str:
         """Анализирует все FLAC-треки в папке и переименовывает её в 'Artist - Album'.
 
         Args:
             folder_path: Путь к папке альбома.
+            force_common_artists: Если True, игнорирует тег риппера и берёт артистов,
+                присутствующих во всех треках альбома, сортируя их по алфавиту.
 
         Returns:
             Новый (или неизменённый) строковый путь к папке.
@@ -112,7 +116,16 @@ class FileSystemManager:
         best_album = Counter(album_names).most_common(1)[0][0] if album_names else "Unknown_Release"
 
         # 3. Определение артиста(ов) релиза
-        if album_artists_list:
+        if force_common_artists and track_artists_sets:
+            common = set.intersection(*track_artists_sets)
+            if common:
+                final_artists = sorted(common, key=lambda s: s.casefold())
+            elif album_artists_list:
+                best_aa = Counter(album_artists_list).most_common(1)[0][0]
+                final_artists = sorted(best_aa, key=lambda s: s.casefold())
+            else:
+                final_artists = ["Various Artists"]
+        elif album_artists_list:
             best_aa = Counter(album_artists_list).most_common(1)[0][0]
             final_artists = list(best_aa)
         elif track_artists_sets:
