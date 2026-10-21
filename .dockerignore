@@ -5,38 +5,27 @@
 __pycache__/
 *.py[cod]
 *.pyo
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Среда разработки
 venv/
 .venv/
 env/
 
-# Секреты и личные данные — НИКОГДА в образ
+# Секреты и личные данные
 .env
 artists_cache.json
 navidrome.db
 unknown_artists.txt
 *.log
 
-# Медиафайлы и тестовые данные
-test_music/
-inbox/
-staging/
-library/
+# Медиафайлы
 *.flac
 *.lrc
 cover.jpg
 
 # Артефакты разработки
 .git/
-.scratch/
-.gemini/
-.claude/
 .idea/
 .vscode/
 *.swp
 *~
 .DS_Store
+Thumbs.db

@@ -3,11 +3,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-
-# Environments
 venv/
 .venv/
 env/
@@ -29,25 +24,12 @@ unknown_artists.txt
 *.log
 
 # Audio files, covers, test data
-test_music/
-inbox/
-staging/
-library/
 *.flac
 *.lrc
 cover.jpg
 
-# Docs
-docs/
 
-# AI assistants, IDEs, and OS artifacts
-CLAUDE.md
-CONTEXT.md
-IDEA.md
-.scratch/
-.claude/
-.gemini/
-.cursor/
+# IDEs, and OS artifacts
 .idea/
 .vscode/
 *.swp
