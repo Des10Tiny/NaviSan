@@ -1,0 +1,22 @@
+# NaviSan — Telegram-бот для автоматической обработки FLAC-коллекции для Navidrome
+# Запуск: docker compose up -d
+services:
+  navisan:
+    build: .
+    image: navisan:latest
+    container_name: navisan
+    user: "1000:1000"
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Inbox — папка, куда торрент-клиент или Soulseek складывает закачки
+      - ./inbox:/inbox:rw
+      # Staging — временная рабочая директория бота
+      - ./staging:/staging:rw
+      # Library — чистовая медиатека, которую читает сервер Navidrome
+      - ./library:/library:rw
+      # База данных Navidrome (read-only) для сверки канонических имён артистов
+      - ./navidrome.db:/data/navidrome.db:ro
+      # Локальный кеш сопоставления артистов
+      - ./artists_cache.json:/app/artists_cache.json:rw
