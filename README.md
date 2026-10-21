@@ -128,7 +128,7 @@ cd /opt/navisan
 Скопируй образец конфигурации:
 ```bash
 cp .env.example .env
-nano .env
+vim .env
 ```
 
 Заполни параметры:
@@ -231,7 +231,7 @@ pip install -r requirements.txt
 
 # 3. Настройка конфигурации
 cp .env.example .env
-nano .env
+vim .env
 ```
 
 В `.env` укажи локальные пути:
