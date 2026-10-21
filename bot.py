@@ -94,6 +94,7 @@ INBOX: Path = Path(os.environ.get("NAVISAN_INBOX", "/inbox"))
 STAGING: Path = Path(os.environ.get("NAVISAN_STAGING", "/staging"))
 LIBRARY: Path = Path(os.environ.get("NAVISAN_LIBRARY", "/library"))
 DB_PATH: str = os.environ.get("NAVISAN_DB", "navidrome.db")
+DEFAULT_ACTION: str = os.environ.get("NAVISAN_DEFAULT_ACTION", "manual").lower()
 
 
 # ── Состояние сессии (State Machine) ──────────────────────────────────────────
@@ -275,6 +276,20 @@ async def _on_new_release(folder: Path, app: Application, is_recover: bool = Fal
     except Exception:
         pass
 
+    # Автоматический режим (если в .env задано NAVISAN_DEFAULT_ACTION=auto)
+    if DEFAULT_ACTION == "auto" and not is_recover:
+        chosen = candidates[0] if candidates else None
+        session.chosen_cover = chosen
+        session.state = SessionState.PROCESSING
+        cover_info = f"обложка #{1} [{chosen.source}]" if chosen else "без обложки"
+        proc_msg = await app.bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"⚙️ *Автоматическая обработка релиза ({cover_info}):*\n🎵 {artist} — {album}",
+            parse_mode="Markdown",
+        )
+        await _execute_pipeline_and_report(proc_msg, app.bot, session)
+        return
+
     if candidates:
         try:
             msg_id = await _send_native_slideshow(app, session)
@@ -401,8 +416,9 @@ async def on_cover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await _execute_pipeline_and_report(status_msg, ctx, session)
 
 
-async def _execute_pipeline_and_report(status_msg, ctx: ContextTypes.DEFAULT_TYPE, session: AlbumSession) -> None:
+async def _execute_pipeline_and_report(status_msg, ctx_or_bot, session: AlbumSession) -> None:
     """Выполняет пайплайн и заменяет статусное сообщение на финальный аккуратный отчёт."""
+    bot = ctx_or_bot.bot if hasattr(ctx_or_bot, "bot") else ctx_or_bot
     loop = asyncio.get_running_loop()
     try:
         report_lines, library_folder = await loop.run_in_executor(
@@ -413,14 +429,14 @@ async def _execute_pipeline_and_report(status_msg, ctx: ContextTypes.DEFAULT_TYP
         session.state = SessionState.DONE
         error_text = f"❌ Ошибка обработки: `{e}`"
         try:
-            await ctx.bot.edit_message_text(
+            await bot.edit_message_text(
                 chat_id=OWNER_ID,
                 message_id=status_msg.message_id,
                 text=error_text,
                 parse_mode="Markdown",
             )
         except Exception:
-            await ctx.bot.send_message(chat_id=OWNER_ID, text=error_text, parse_mode="Markdown")
+            await bot.send_message(chat_id=OWNER_ID, text=error_text, parse_mode="Markdown")
         return
 
     session.state = SessionState.DONE
@@ -440,7 +456,7 @@ async def _execute_pipeline_and_report(status_msg, ctx: ContextTypes.DEFAULT_TYP
     ]
 
     try:
-        await ctx.bot.edit_message_text(
+        await bot.edit_message_text(
             chat_id=OWNER_ID,
             message_id=status_msg.message_id,
             text=final_text,
@@ -448,7 +464,7 @@ async def _execute_pipeline_and_report(status_msg, ctx: ContextTypes.DEFAULT_TYP
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
     except Exception:
-        await ctx.bot.send_message(
+        await bot.send_message(
             chat_id=OWNER_ID,
             text=final_text,
             parse_mode="Markdown",
