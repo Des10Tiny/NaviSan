@@ -616,12 +616,16 @@ def upgrade_library(
     progress_callback: Callable[[int, int, str, dict], None] | None = None,
     cancel_flag: Callable[[], bool] | None = None,
     force: bool = False,
+    target_albums: list[Path] | None = None,
 ) -> dict:
-    """Выполняет пакетную стандартизацию («идеализацию») всех альбомов в Library."""
-    all_albums = sorted([
-        d for d in library_dir.iterdir()
-        if d.is_dir() and any(f.suffix.lower() == ".flac" for f in d.rglob("*.flac") if f.is_file())
-    ])
+    """Выполняет пакетную стандартизацию («идеализацию») альбомов в Library."""
+    if target_albums is not None:
+        all_albums = sorted(target_albums)
+    else:
+        all_albums = sorted([
+            d for d in library_dir.iterdir()
+            if d.is_dir() and any(f.suffix.lower() == ".flac" for f in d.rglob("*.flac") if f.is_file())
+        ])
 
     total = len(all_albums)
     processed = 0

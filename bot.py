@@ -887,17 +887,34 @@ async def cmd_upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
         return
 
+    args = ctx.args or []
+    query_parts = [a for a in args if a.lower() != "force"]
+    query_str = " ".join(query_parts).strip()
+
+    if query_str:
+        matches = [d for d in albums if query_str.lower() in d.name.lower()]
+        if not matches:
+            msg = await update.message.reply_text(f"❌ В {LIBRARY.name} не найдено альбомов по запросу: `{query_str}`", parse_mode="Markdown")
+            delete_later(ctx.bot, OWNER_ID, msg.message_id, delay=4.0)
+            delete_later(ctx.bot, OWNER_ID, update.message.message_id, delay=4.0)
+            return
+        albums = matches
+        ctx.bot_data["upgrade_target_albums"] = [str(a) for a in albums]
+    else:
+        ctx.bot_data.pop("upgrade_target_albums", None)
+
     try:
         await update.message.delete()
     except Exception:
         pass
 
+    target_desc = f"По запросу: `{query_str}` ({len(albums)} альбомов)" if query_str else f"Всей библиотеки ({len(albums)} альбомов)"
     text = (
         f"📁 Каталог: `{LIBRARY.name}`\n"
-        f"💿 Альбомов для обработки: *{len(albums)}*\n\n"
-        "*Выбери режим идеализации библиотеки:*\n\n"
+        f"💿 Режим: *{target_desc}*\n\n"
+        "*Выбери режим идеализации:*\n\n"
         "• ▶️ *Обычный (мягкий)* — быстро заполнит только пропуски: найдет недостающие обложки, недостающие тексты и проставит ReplayGain. Существующие файлы не перезаписывает.\n\n"
-        "• ⚡ *Force (полная пересборка)* — с нуля очистит теги от мусора, перекачает Hi-Res обложки, обновит тексты (с защитой караоке от даунгрейда) и заново рассчитает ReplayGain для всей библиотеки."
+        "• ⚡ *Force (полная пересборка)* — с нуля очистит теги от мусора (извлечёт фиты из названий), перекачает Hi-Res обложки, обновит тексты (с защитой караоке от даунгрейда) и заново рассчитает ReplayGain."
     )
 
     keyboard = [
@@ -982,6 +999,10 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         init_kb = [[InlineKeyboardButton("⏹️ Остановить", callback_data="upgrade:stop")]]
         await _safe_edit_message(query, init_text, reply_markup=InlineKeyboardMarkup(init_kb))
 
+        target_albums_list = None
+        if "upgrade_target_albums" in ctx.bot_data:
+            target_albums_list = [Path(p) for p in ctx.bot_data["upgrade_target_albums"]]
+
         try:
             summary = await loop.run_in_executor(
                 None,
@@ -991,10 +1012,12 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
                     progress_callback=_on_progress,
                     cancel_flag=_is_cancelled,
                     force=is_force,
+                    target_albums=target_albums_list,
                 ),
             )
         finally:
             ctx.bot_data["upgrade_running"] = False
+            ctx.bot_data.pop("upgrade_target_albums", None)
 
         stopped_str = " (прервано пользователем)" if ctx.bot_data.get("upgrade_cancelled") else ""
         rg_added_str = f"\n🔊 ReplayGain рассчитан: *{summary.get('replaygain_added', 0)}* альбомов" if summary.get("replaygain_added") else ""
@@ -2079,6 +2102,11 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                 pass
 
         lrc_path.write_text(res.text, encoding="utf-8")
+        try:
+            lrc_path.chmod(0o664)
+            os.utime(str(track_path), None)
+        except Exception:
+            pass
 
         if already_identical:
             await query.answer(f"ℹ️ Этот текст уже загружен из {src_name}")
@@ -2261,7 +2289,13 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
                 res = lm.find_lyrics(artist, title, album, dur)
                 if res and res.text:
-                    tr.with_suffix(".lrc").write_text(res.text, encoding="utf-8")
+                    lrc_p = tr.with_suffix(".lrc")
+                    lrc_p.write_text(res.text, encoding="utf-8")
+                    try:
+                        lrc_p.chmod(0o664)
+                        os.utime(str(tr), None)
+                    except Exception:
+                        pass
                     found += 1
             return found
 
@@ -2617,6 +2651,11 @@ async def on_owner_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
         lrc_path = track_path.with_suffix(".lrc")
         lrc_path.write_text(text_to_save, encoding="utf-8")
+        try:
+            lrc_path.chmod(0o664)
+            os.utime(str(track_path), None)
+        except Exception:
+            pass
 
         if card_id:
             from_report = bool(ctx.bot_data.get("lyrics_from_report"))

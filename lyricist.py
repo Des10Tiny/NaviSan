@@ -430,6 +430,11 @@ class LyricManager:
                     return "Сохранено караоке 🎤 (в сети только обычный)"
 
                 lrc_path.write_text(res.text, encoding="utf-8")
+                try:
+                    lrc_path.chmod(0o664)
+                    os.utime(str(path), None)
+                except Exception:
+                    pass
                 source_labels = {
                     "lrclib": "LRCLIB",
                     "lrcmux": "LRCMUX",
@@ -507,6 +512,11 @@ class LyricManager:
             synced_text = align_lyrics(path, plain_text, model=model)
             if synced_text and has_timestamps(synced_text):
                 lrc_path.write_text(synced_text, encoding="utf-8")
+                try:
+                    lrc_path.chmod(0o664)
+                    os.utime(str(path), None)
+                except Exception:
+                    pass
                 res = LyricResult(
                     text=synced_text,
                     is_synced=True,
@@ -524,6 +534,13 @@ class LyricManager:
         text = text.strip()
         is_sync = has_timestamps(text)
         lrc_path.write_text(text, encoding="utf-8")
+        try:
+            lrc_path.chmod(0o664)
+            flac_path = lrc_path.with_suffix(".flac")
+            if flac_path.exists():
+                os.utime(str(flac_path), None)
+        except Exception:
+            pass
         return LyricResult(text=text, is_synced=is_sync, source="manual")
 
 
