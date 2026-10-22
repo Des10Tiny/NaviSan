@@ -51,6 +51,26 @@ def preview_lyrics(text: str, max_lines: int = 6) -> str:
     return "\n".join(preview)
 
 
+# Паттерн для китайских метаданных из KuGou/NetEase (作词, 作曲, 编曲 и т.д.)
+CJK_META_RE = re.compile(
+    r"^(?:\[\d{2}:\d{2}\.\d+\]\s*)?(?:作词|作曲|编曲|制作人|词|曲|录音|混音|母带|监制)\s*[:：]",
+    re.I,
+)
+
+
+def clean_lrc_metadata(text: str) -> str:
+    """Удаляет мусорные служебные строки (китайские кредиты 作词/作曲 из KuGou/NetEase)."""
+    if not text:
+        return ""
+    lines = []
+    for l in text.splitlines():
+        trimmed = l.strip()
+        if not trimmed or CJK_META_RE.match(trimmed):
+            continue
+        lines.append(trimmed)
+    return "\n".join(lines).strip()
+
+
 # ── Менеджер текстов ──────────────────────────────────────────────────────────
 
 class LyricManager:
@@ -345,10 +365,8 @@ class LyricManager:
                         elif txt:
                             out.append(txt)
 
-                    full_text = "\n".join(out).strip()
+                    full_text = clean_lrc_metadata("\n".join(out))
                     if full_text:
-                        from aligner import clean_lyrics_metadata
-                        full_text = clean_lyrics_metadata(full_text)
                         return LyricResult(
                             text=full_text,
                             is_synced=has_sync,
@@ -383,10 +401,9 @@ class LyricManager:
             # Ищем исключительно синхронизированный текст (с таймкодами)
             lrc_text = syncedlyrics.search(search_query, synced_only=True)
             if lrc_text and has_timestamps(lrc_text):
-                from aligner import clean_lyrics_metadata
-                clean_lrc = clean_lyrics_metadata(lrc_text.strip())
+                cleaned_lrc = clean_lrc_metadata(lrc_text)
                 return LyricResult(
-                    text=clean_lrc,
+                    text=cleaned_lrc,
                     is_synced=True,
                     source="syncedlyrics",
                     track_title=title,
@@ -613,8 +630,7 @@ class LyricManager:
 
     def save_manual_lyrics(self, lrc_path: Path, text: str) -> LyricResult:
         """Сохраняет вручную введённый текст в файл .lrc."""
-        from aligner import clean_lyrics_metadata
-        text = clean_lyrics_metadata(text.strip())
+        text = text.strip()
         is_sync = has_timestamps(text)
         lrc_path.write_text(text, encoding="utf-8")
         try:

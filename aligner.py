@@ -1,31 +1,25 @@
 """Модуль нейросетевого выравнивания текста песни по аудиофайлу (Forced Alignment).
 
-Объединяет:
-- faster-whisper (CTranslate2): легковесный C++ рантайм без тяжелого PyTorch (0 MB RAM в простое).
-- syncalong: алгоритм глобального динамического программирования Needleman-Wunsch (DP) для
-  математически эталонного монотонного выравнивания слов и интерполяции таймкодов.
+Использует C++ рантайм faster-whisper (CTranslate2) для транскрипции
+и lyric-align для устойчивого character-level анкоринга строк на таймлайне аудио.
 """
 
 from __future__ import annotations
 
 import gc
 import logging
-import os
 import re
 from pathlib import Path
 
-from syncalong.align import _dp_align, align_lyrics_to_transcript
-from syncalong.formatter import format_lrc
-from syncalong.lyrics import lyrics_prompt, parse_lyrics_text
-from syncalong.textnorm import normalize
-from syncalong.transcribe import WordTimestamp
-
 log = logging.getLogger(__name__)
 
-# Регулярное выражение для фильтрации метаданных NetEase / KuGou и стандартных тегов
-METADATA_LINE_RE = re.compile(
-    r"^(?:作词|作曲|编曲|制作人|录音|混音|母带|吉他|贝斯|鼓|键盘|和声|弦乐|监制|企划|统筹)\s*[:：]|^\[(?:ar|al|ti|by|offset|length):",
-    re.IGNORECASE,
+# Паттерн для заголовков секций Genius ([Куплет 1], [Chorus], [Интро] и т.д.)
+SECTION_HEADER_RE = re.compile(r"^[\[(][^\[\]()]{1,60}[\])]$")
+
+# Паттерн для китайских метаданных из KuGou/NetEase (作词, 作曲, 编曲 и т.д.)
+CJK_META_RE = re.compile(
+    r"^(?:\[\d{2}:\d{2}\.\d+\]\s*)?(?:作词|作曲|编曲|制作人|词|曲|录音|混音|母带|监制)\s*[:：]",
+    re.I,
 )
 
 
@@ -45,64 +39,54 @@ def _patch_av_open() -> None:
         log.debug("Не удалось пропатчить av.open: %s", e)
 
 
-def clean_lyrics_metadata(text: str) -> str:
-    """Очищает текст от технических кредитов и служебных мета-строк NetEase / KuGou."""
-    if not text:
-        return ""
-    lines = []
-    for line in text.split("\n"):
-        stripped = line.strip()
-        content = re.sub(r"^\[\d{2}:\d{2}\.\d+\]\s*", "", stripped).strip()
-        if METADATA_LINE_RE.match(content):
-            continue
-        lines.append(line)
-    return "\n".join(lines).strip()
-
-
 def align_lyrics(
     audio_path: str | Path,
     plain_text: str,
     language: str | None = None,
-    model_size: str | None = None,
+    model_size: str = "tiny",
     model: any = None,
-    threshold: float = 55.0,
 ) -> str:
-    """Выравнивает текст песни по аудиофайлу через faster-whisper + syncalong Needleman-Wunsch DP.
+    """Выравнивает текст песни по аудиофайлу, расставляя таймкоды [mm:ss.xx].
 
     Args:
         audio_path: Путь к аудиофайлу (FLAC/MP3/WAV).
         plain_text: Обычный текст песни (например, с Genius).
         language: Код языка ("ru", "en" и т.д.) или None для автоопределения.
-        model_size: Размер модели faster-whisper ("base" по умолчанию).
+        model_size: Размер модели faster-whisper ("tiny" по умолчанию).
         model: Опциональный уже загруженный экземпляр WhisperModel для пакетных операций.
-        threshold: Минимальный порог нечёткого сходства слов (по умолчанию 55.0).
 
     Returns:
         Синхронизированный текст в формате .lrc.
     """
     _patch_av_open()
 
-    cleaned_text = clean_lyrics_metadata(plain_text)
-    if not cleaned_text:
+    raw_lines = [l.strip() for l in plain_text.strip().split("\n")]
+    if not raw_lines:
         return ""
 
-    parsed_lines = parse_lyrics_text(cleaned_text)
-    vocal_lines = [line for line in parsed_lines if not line.is_blank and line.words]
-    if not vocal_lines:
-        return cleaned_text
+    # Отфильтровываем пустые строки, служебные комментарии, китайские кредиты и заголовки секций
+    lyric_lines: list[str] = []
+    for line in raw_lines:
+        if not line or line.startswith("#"):
+            continue
+        if CJK_META_RE.match(line):
+            continue
+        if SECTION_HEADER_RE.match(line):
+            continue
+        lyric_lines.append(line)
 
-    # 1. Запуск транскрипции с таймкодами слов через faster-whisper
+    if not lyric_lines:
+        return plain_text
+
+    # 1. Запуск транскрипции через faster-whisper
     try:
         from faster_whisper import WhisperModel
     except ImportError as e:
         log.error("faster-whisper не установлен: %s", e)
-        return cleaned_text
+        return plain_text
 
-    if not model_size:
-        model_size = os.getenv("NAVISAN_WHISPER_MODEL", "base")
-
-    whisper_words: list[WordTimestamp] = []
     should_cleanup_model = False
+    segments_raw = []
     try:
         if model is None:
             log.info("Загрузка модели faster-whisper (%s)...", model_size)
@@ -110,75 +94,77 @@ def align_lyrics(
             should_cleanup_model = True
 
         # Автоопределение языка по тексту песни, если не задан явно
-        if not language and cleaned_text:
-            if re.search(r"[а-яА-ЯёЁ]", cleaned_text):
+        if not language and plain_text:
+            if re.search(r"[а-яА-ЯёЁ]", plain_text):
                 language = "ru"
-            elif re.search(r"[a-zA-Z]", cleaned_text):
+            elif re.search(r"[a-zA-Z]", plain_text):
                 language = "en"
 
-        # Первые строки песни в качестве подсказки (initial_prompt) для vocabulary biasing
-        prompt = lyrics_prompt(parsed_lines)
+        # Первые слова песни в качестве подсказки для словаря Whisper
+        prompt_words = [w for w in plain_text.split() if not (w.startswith("[") and w.endswith("]"))]
+        initial_prompt = " ".join(prompt_words[:50]) if prompt_words else None
 
-        # vad_filter=False — критично для музыки, иначе VAD вырезает до 95% аудио на громком басе/бите
-        segments, info = model.transcribe(
+        # ВАЖНО: vad_filter=False! Для музыки с плотным битом / басом / автотюном VAD
+        # ошибочно считает музыку шумом и вырезает до 95% аудиопотока.
+        segments_gen, info = model.transcribe(
             str(audio_path),
             word_timestamps=True,
             language=language,
             condition_on_previous_text=False,
             vad_filter=False,
-            initial_prompt=prompt or None,
+            initial_prompt=initial_prompt,
         )
-
-        for segment in segments:
-            if segment.words:
-                for w in segment.words:
-                    norm_w = normalize(w.word)
-                    if norm_w:
-                        whisper_words.append(
-                            WordTimestamp(
-                                word=norm_w,
-                                raw=w.word,
-                                start=w.start,
-                                end=w.end,
-                            )
-                        )
+        segments_raw = list(segments_gen)
     except Exception as e:
         log.error("Ошибка транскрипции faster-whisper для %s: %s", audio_path, e)
-        return cleaned_text
+        return plain_text
     finally:
         if should_cleanup_model and model is not None:
             del model
             gc.collect()
 
-    if not whisper_words:
-        log.warning("faster-whisper не обнаружил слов в аудио %s", audio_path)
-        return cleaned_text
+    if not segments_raw:
+        log.warning("faster-whisper не обнаружил сегментов в %s", audio_path)
+        return plain_text
 
-    # 2. Проверка на соответствие текста и аудио (защита от чужой песни)
-    # Вычисляем матрицу DP и проверяем долю вокальных строк, где совпали слова
-    flat_words: list[str] = []
-    word_to_line: list[int] = []
-    for li, line in enumerate(parsed_lines):
-        for w in line.words:
-            flat_words.append(w)
-            word_to_line.append(li)
+    # 2. Выравнивание через специализированную библиотеку lyric-align
+    try:
+        from lyric_align import align, interpolate_gaps
+        from lyric_align.model import Segment, Word
+        from lyric_align.formats import to_lrc
 
-    mapping = _dp_align(flat_words, whisper_words, threshold=threshold)
-    matched_lines = {word_to_line[i] for i in mapping.keys()}
-    total_vocal = len(vocal_lines)
+        fw_segments = []
+        for s in segments_raw:
+            words = [Word(float(w.start), float(w.end), w.word) for w in (s.words or [])]
+            fw_segments.append(Segment(float(s.start), float(s.end), s.text.strip(), words))
 
-    if total_vocal > 0:
-        match_ratio = len(matched_lines) / total_vocal
+        # Сравниваем стратегию построчного сопоставления (pairing=1) и авто-группировки
+        aligned_1 = align(fw_segments, lyric_lines, pairing=1)
+        aligned_auto = align(fw_segments, lyric_lines, pairing="auto")
+
+        m1 = sum(1 for a in aligned_1 if a.matched)
+        ma = sum(1 for a in aligned_auto if a.matched)
+
+        best_aligned = aligned_1 if m1 >= ma else aligned_auto
+        best_matches = max(m1, ma)
+        total_lines = len(lyric_lines)
+        match_ratio = (best_matches / total_lines) if total_lines > 0 else 0.0
+
+        # Защита от чужого текста песни (несоответствие аудио)
         if match_ratio < 0.25:
             log.warning(
                 "Forced alignment mismatch: текст не соответствует аудио %s (совпало всего %d/%d строк, %.1f%%). Выравнивание отменено.",
                 audio_path,
-                len(matched_lines),
-                total_vocal,
+                best_matches,
+                total_lines,
                 match_ratio * 100,
             )
-            return cleaned_text
+            return plain_text
 
-    # 3. Глобальное динамическое программирование syncalong (Needleman-Wunsch DP) + интерполяция
-    timed_lines = align_lyrics_to_transcript(parsed_lines, whisper_words, threshold=threshold)
-    return format_lrc(timed_lines)
+        interpolated = interpolate_gaps(best_aligned)
+        synced_lrc = to_lrc(interpolated).strip()
+        return synced_lrc if synced_lrc else plain_text
+
+    except Exception as e:
+        log.error("Ошибка при выравнивании через lyric-align: %s", e)
+        return plain_text
