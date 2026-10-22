@@ -1,6 +1,9 @@
 """Модуль нейросетевого выравнивания текста песни по аудиофайлу (Forced Alignment).
 
-Использует легковесный C++ рантайм faster-whisper (CTranslate2) без тяжелого PyTorch.
+Использует легковесный C++ рантайм faster-whisper (CTranslate2) без тяжелого PyTorch
+и алгоритм глобального динамического программирования Needleman-Wunsch (портированный из syncalong)
+для строго монотонного и точного сопоставления слов песни.
+
 Модель загружается исключительно в момент выравнивания и сразу выгружается из памяти,
 сохраняя 0 MB RAM в режиме ожидания.
 """
@@ -10,12 +13,24 @@ from __future__ import annotations
 import gc
 import logging
 import re
+from functools import cache
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 # Паттерн для заголовков секций Genius вида [Куплет 1], [Chorus], [Интро], [Outro] и т.д.
 SECTION_HEADER_RE = re.compile(r"^\[[^\]]+\]$")
+
+# Паттерн для технических метаданных азиатских платформ (NetEase/KuGou) и тегов LRC
+METADATA_LINE_RE = re.compile(
+    r"^(?:"
+    r"\[(?:ar|al|ti|au|by|offset|length|re|ve):.*\]|"
+    r"(?:作词|作曲|编曲|制作人|录音|混音|母带|吉他|贝斯|鼓|键盘|和声|弦乐|策划|监制|企划|发行)\s*[:：].*|"
+    r"(?:lyrics\s*by|written\s*by|composed\s*by|produced\s*by|arranged\s*by)\s*[:：].*|"
+    r"(?:qq音乐|网易云音乐|酷狗音乐).*"
+    r")$",
+    re.IGNORECASE,
+)
 
 
 def _patch_av_open() -> None:
@@ -39,6 +54,163 @@ def _clean_word(word: str) -> str:
     return re.sub(r"[^\w]", "", (word or "").lower())
 
 
+try:
+    from rapidfuzz.fuzz import ratio as _rf_ratio
+
+    def _ratio(a: str, b: str) -> float:
+        return float(_rf_ratio(a, b))
+
+except ImportError:
+    from difflib import SequenceMatcher
+
+    def _ratio(a: str, b: str) -> float:
+        return SequenceMatcher(None, a, b).ratio() * 100.0
+
+
+@cache
+def _word_score(a: str, b: str) -> float:
+    """Возвращает схожесть 0–100 между двумя нормализованными словами с кэшированием."""
+    if a == b:
+        return 100.0
+    return _ratio(a, b)
+
+
+def _dp_align(
+    lyric_words: list[str],
+    transcript_words: list[dict],
+    threshold: float = 55.0,
+) -> dict[int, int]:
+    """Глобальное динамическое программирование Needleman-Wunsch (алгоритм syncalong).
+
+    Строит строго монотонное соответствие {lyric_word_idx: transcript_word_idx},
+    максимизирующее суммарный score совпадений слов.
+
+    Args:
+        lyric_words: Список всех нормализованных слов текста по порядку.
+        transcript_words: Список распознанных Whisper слов [{'word', 'start', 'end'}].
+        threshold: Минимальный fuzzy score (0-100) для зачёта совпадения.
+
+    Returns:
+        Словарь {индекс_слова_текста: индекс_слова_в_аудио}.
+    """
+    n = len(lyric_words)
+    m = len(transcript_words)
+
+    if n == 0 or m == 0:
+        return {}
+
+    SKIP_LYRIC_PENALTY = -1.0  # Небольшой штраф за пропуск слова из текста
+
+    size = (n + 1) * (m + 1)
+    dp = [0.0] * size
+    trace = [0] * size  # 1: skip transcript, 2: skip lyric, 3: match
+
+    # Инициализация первой колонки (пропуск слов текста)
+    for i in range(1, n + 1):
+        dp[i * (m + 1)] = dp[(i - 1) * (m + 1)] + SKIP_LYRIC_PENALTY
+        trace[i * (m + 1)] = 2
+
+    # Заполнение матрицы DP
+    for i in range(1, n + 1):
+        lw = lyric_words[i - 1]
+        row_offset = i * (m + 1)
+        prev_row_offset = (i - 1) * (m + 1)
+
+        for j in range(1, m + 1):
+            tw = transcript_words[j - 1]["word"]
+
+            # Вариант 1: пропуск слова аудио
+            best = dp[row_offset + j - 1]
+            best_t = 1
+
+            # Вариант 2: пропуск слова текста
+            val = dp[prev_row_offset + j] + SKIP_LYRIC_PENALTY
+            if val > best:
+                best = val
+                best_t = 2
+
+            # Вариант 3: сопоставление слов
+            score = _word_score(lw, tw)
+            if score >= threshold:
+                val = dp[prev_row_offset + j - 1] + score
+                if val > best:
+                    best = val
+                    best_t = 3
+
+            dp[row_offset + j] = best
+            trace[row_offset + j] = best_t
+
+    # Обратный ход (Traceback)
+    mapping: dict[int, int] = {}
+    i, j = n, m
+    while i > 0 and j > 0:
+        t = trace[i * (m + 1) + j]
+        if t == 3:
+            mapping[i - 1] = j - 1
+            i -= 1
+            j -= 1
+        elif t == 2:
+            i -= 1
+        else:
+            j -= 1
+
+    return mapping
+
+
+def _interpolate_gaps(
+    lines: list[tuple[int, str, bool]],
+    timestamps: dict[int, float],
+    matched: list[int],
+) -> None:
+    """Интерполирует таймкоды для нераспознанных строк между подтверждёнными анкорами."""
+    for k in range(len(matched) - 1):
+        start_li = matched[k]
+        end_li = matched[k + 1]
+        gap = end_li - start_li
+
+        if gap <= 1:
+            continue
+
+        t_start = timestamps[start_li]
+        t_end = timestamps[end_li]
+
+        for offset in range(1, gap):
+            li = start_li + offset
+            _, text, is_header = lines[li]
+            if is_header or not text.strip():
+                continue
+            frac = offset / gap
+            timestamps[li] = t_start + frac * (t_end - t_start)
+
+
+def _extrapolate_edges(
+    lines: list[tuple[int, str, bool]],
+    timestamps: dict[int, float],
+    matched: list[int],
+    *,
+    t_min: float,
+    t_max: float,
+) -> None:
+    """Экстраполирует таймкоды для строк до первого и после последнего распознавания."""
+    first, last = matched[0], matched[-1]
+
+    gap_first = first - (-1)
+    for li in range(first):
+        _, text, is_header = lines[li]
+        if is_header or not text.strip():
+            continue
+        frac = (li + 1) / gap_first
+        timestamps[li] = max(0.0, t_min + frac * (timestamps[first] - t_min))
+
+    gap_last = len(lines) - last
+    for li in range(last + 1, len(lines)):
+        _, text, is_header = lines[li]
+        if is_header or not text.strip():
+            continue
+        frac = (li - last) / gap_last
+        timestamps[li] = timestamps[last] + frac * (t_max - timestamps[last])
+
+
 def align_lyrics(
     audio_path: str | Path,
     plain_text: str,
@@ -46,28 +218,20 @@ def align_lyrics(
     model_size: str = "tiny",
     model: any = None,
 ) -> str:
-    """Выравнивает текст песни по аудиофайлу, расставляя таймкоды [mm:ss.xx].
-
-    Args:
-        audio_path: Путь к аудиофайлу (FLAC/MP3/WAV).
-        plain_text: Обычный текст песни (например, с Genius).
-        language: Код языка ("ru", "en" и т.д.) или None для автоопределения.
-        model_size: Размер модели faster-whisper ("tiny" по умолчанию).
-        model: Опциональный уже загруженный экземпляр WhisperModel для пакетных операций.
-
-    Returns:
-        Синхронизированный текст в формате .lrc.
-    """
+    """Выравнивает текст песни по аудиофайлу с помощью глобального DP Needleman-Wunsch."""
     _patch_av_open()
 
     raw_lines = [l.strip() for l in plain_text.strip().split("\n")]
     if not raw_lines:
         return ""
 
-    # Отфильтровываем пустые строки и служебные теги [Куплет], сохраняя структуру
+    # Отфильтровываем метаданные, пустые строки и помечаем служебные теги [Куплет]
     cleaned_lines: list[tuple[int, str, bool]] = []
     for idx, line in enumerate(raw_lines):
         if not line:
+            continue
+        cleaned_content = re.sub(r"^\[\d{2}:\d{2}(?:\.\d+)?\]\s*", "", line).strip()
+        if not cleaned_content or METADATA_LINE_RE.match(cleaned_content):
             continue
         is_header = bool(SECTION_HEADER_RE.match(line))
         cleaned_lines.append((idx, line, is_header))
@@ -75,7 +239,7 @@ def align_lyrics(
     if not cleaned_lines:
         return plain_text
 
-    # 1. Запуск транскрипции с таймкодами слов через faster-whisper
+    # 1. Запуск транскрипции через faster-whisper
     try:
         from faster_whisper import WhisperModel
     except ImportError as e:
@@ -105,7 +269,7 @@ def align_lyrics(
             word_timestamps=True,
             language=language,
             condition_on_previous_text=False,
-            vad_filter=True,
+            vad_filter=False,  # ВАЖНО: False для музыки, чтобы не вырезать вокал под битом
             initial_prompt=words_prompt or None,
         )
 
@@ -132,85 +296,40 @@ def align_lyrics(
         log.warning("faster-whisper не обнаружил слов в аудио %s", audio_path)
         return plain_text
 
-    # 2. Нечёткое выравнивание строк текста по распознанным таймкодам слов
-    try:
-        from rapidfuzz import fuzz
-    except ImportError:
-        fuzz = None
-
-    line_results: list[dict] = []
-    w_idx = 0
-    total_words = len(whisper_words)
-    unmatched_streak = 0
-    matched_lines_count = 0
+    # 2. Подготовка плоского списка слов текста с обратной привязкой к строкам
+    flat_words: list[str] = []
+    word_to_line: list[int] = []
     total_vocal_lines = 0
 
-    for orig_idx, line, is_header in cleaned_lines:
-        # Служебные заголовки секций Genius ([Куплет 1], [Припев]) не выравниваем
+    for li, (_, line, is_header) in enumerate(cleaned_lines):
         if is_header:
-            line_results.append({"line": line, "time": None, "is_header": True})
             continue
+        line_w = [_clean_word(w) for w in line.split() if _clean_word(w)]
+        if line_w:
+            total_vocal_lines += 1
+            for w in line_w:
+                flat_words.append(w)
+                word_to_line.append(li)
 
-        line_words = [_clean_word(w) for w in line.split() if _clean_word(w)]
-        if not line_words:
-            line_results.append({"line": line, "time": None, "is_header": False})
-            continue
+    if not flat_words:
+        return plain_text
 
-        total_vocal_lines += 1
-        start_time: float | None = None
+    # 3. Выравнивание через Needleman-Wunsch Dynamic Programming (syncalong)
+    mapping = _dp_align(flat_words, whisper_words, threshold=55.0)
 
-        if w_idx < total_words:
-            # Ищем начало строки по первым 3-4 словам с адаптивным опережающим окном
-            words_to_match = min(4, len(line_words))
-            target = " ".join(line_words[:words_to_match])
-            best_score = -1
-            best_idx = w_idx
-            # Окно поиска расширяется при нескольких подряд ненайденных строках
-            scan_window = min(total_words, w_idx + 25 + unmatched_streak * 10)
+    # Привязка первого распознанного слова каждой строки к её таймкоду
+    line_timestamps: dict[int, float] = {}
+    for flat_idx, trans_idx in sorted(mapping.items()):
+        li = word_to_line[flat_idx]
+        ts = whisper_words[trans_idx]["start"]
+        if li not in line_timestamps:
+            line_timestamps[li] = ts
 
-            for scan_idx in range(w_idx, scan_window):
-                cand_len = min(words_to_match, total_words - scan_idx)
-                cand = " ".join(whisper_words[scan_idx + k]["word"] for k in range(cand_len))
-
-                if fuzz:
-                    # Используем максимум между ratio и token_sort_ratio для компенсации пропущенных предлогов (и, а, в)
-                    score = max(fuzz.ratio(target, cand), fuzz.token_sort_ratio(target, cand))
-                else:
-                    score = 100 if target in cand else 0
-
-                if score > best_score:
-                    best_score = score
-                    best_idx = scan_idx
-                if score >= 90:
-                    break
-
-            # Принимаем таймкод только если сходство слов достаточного качества (>= 55%)
-            if best_score >= 55:
-                start_time = whisper_words[best_idx]["start"]
-                # Продвигаем указатель ровно на фактически распознанные Whisper слова этой строки,
-                # а не на длину всей строки текста, чтобы не обогнать аудио
-                matched_span = min(words_to_match, len(line_words))
-                for k in range(matched_span, min(len(line_words), total_words - best_idx)):
-                    w_cand = whisper_words[best_idx + k]["word"]
-                    w_ref = line_words[k]
-                    sim = fuzz.ratio(w_ref, w_cand) if fuzz else (100 if w_ref == w_cand else 0)
-                    if sim >= 60:
-                        matched_span = k + 1
-                    else:
-                        break
-
-                w_idx = min(total_words - 1, best_idx + max(1, matched_span))
-                unmatched_streak = 0
-                matched_lines_count += 1
-            else:
-                unmatched_streak += 1
-
-        line_results.append({"line": line, "time": start_time, "is_header": False})
-
-    # Проверка на полное несовпадение текста и аудио (чужая песня)
+    # 4. Проверка на полное несовпадение песни (чужой текст)
+    matched_lines_count = len(line_timestamps)
     if total_vocal_lines > 0:
         match_ratio = matched_lines_count / total_vocal_lines
-        if match_ratio < 0.35:
+        if match_ratio < 0.25:
             log.warning(
                 "Forced alignment mismatch: текст не соответствует аудио %s (совпало всего %d/%d строк, %.1f%%). Выравнивание отменено.",
                 audio_path,
@@ -220,39 +339,31 @@ def align_lyrics(
             )
             return plain_text
 
-    # Интерполяция таймкодов для пропущенных вокальных строк (если песня совпала)
-    vocal_indices = [i for i, r in enumerate(line_results) if not r["is_header"] and r["line"].strip()]
-    for i, idx in enumerate(vocal_indices):
-        if line_results[idx]["time"] is None:
-            prev_t = None
-            for p in range(i - 1, -1, -1):
-                t = line_results[vocal_indices[p]]["time"]
-                if t is not None:
-                    prev_t = t
-                    break
-            next_t = None
-            for n in range(i + 1, len(vocal_indices)):
-                t = line_results[vocal_indices[n]]["time"]
-                if t is not None:
-                    next_t = t
-                    break
+    # 5. Интерполяция и экстраполяция пропущенных строк
+    matched_indices = sorted(line_timestamps.keys())
+    if matched_indices:
+        _interpolate_gaps(cleaned_lines, line_timestamps, matched_indices)
+        _extrapolate_edges(
+            cleaned_lines,
+            line_timestamps,
+            matched_indices,
+            t_min=whisper_words[0]["start"],
+            t_max=whisper_words[-1]["end"],
+        )
 
-            if prev_t is not None and next_t is not None:
-                line_results[idx]["time"] = prev_t + (next_t - prev_t) * 0.5
-            elif prev_t is not None:
-                line_results[idx]["time"] = prev_t + 2.5
-            elif next_t is not None:
-                line_results[idx]["time"] = max(0.0, next_t - 2.5)
-
+    # 6. Сборка итогового .lrc
     synced_lines: list[str] = []
-    for r in line_results:
-        t = r["time"]
+    for li, (_, line, is_header) in enumerate(cleaned_lines):
+        if is_header:
+            synced_lines.append(line)
+            continue
+        t = line_timestamps.get(li)
         if t is not None:
             total_sec = max(0.0, t)
             m = int(total_sec // 60)
             s = total_sec % 60
-            synced_lines.append(f"[{m:02d}:{s:05.2f}] {r['line']}")
+            synced_lines.append(f"[{m:02d}:{s:05.2f}] {line}")
         else:
-            synced_lines.append(r["line"])
+            synced_lines.append(line)
 
     return "\n".join(synced_lines)
