@@ -1024,12 +1024,16 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 
         stopped_str = " (прервано пользователем)" if ctx.bot_data.get("upgrade_cancelled") else ""
         rg_added_str = f"\n🔊 ReplayGain рассчитан: *{summary.get('replaygain_added', 0)}* альбомов" if summary.get("replaygain_added") else ""
+        exp_added_str = f"\n🔞 Explicit (ITUNESADVISORY): *{summary.get('explicit_added', 0)}* треков" if summary.get("explicit_added") else ""
+        lbl_added_str = f"\n🏷️ Лейблы (LABEL): *{summary.get('labels_added', 0)}* альбомов" if summary.get("labels_added") else ""
         final_text = (
             f"✅ *Идеализация библиотеки [{mode_badge}] завершена{stopped_str}!* 🎉\n\n"
             f"💿 Обработано альбомов: *{summary['processed']}/{summary['total']}*\n"
             f"🖼️ Добавлено/обновлено обложек: *{summary['covers_added']}*\n"
             f"📝 Загружено текстов (.lrc): *{summary['lyrics_added']}*"
             f"{rg_added_str}"
+            f"{exp_added_str}"
+            f"{lbl_added_str}"
         )
         final_kb = [[InlineKeyboardButton("❌ Закрыть", callback_data="upgrade:close")]]
         await _safe_edit_message(query, final_text, reply_markup=InlineKeyboardMarkup(final_kb))

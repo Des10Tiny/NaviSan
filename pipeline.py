@@ -19,9 +19,9 @@ from pathlib import Path
 import httpx
 from mutagen.flac import FLAC
 
-from covers import CoverCandidate, download_cover, search_covers
+from covers import CoverCandidate, download_cover, search_covers, is_valid_cover_candidate
 from sanitizer import TagSanitizer
-from surgeon import FLACSurgeon
+from surgeon import FLACSurgeon, clean_date_str
 from renamer import FileSystemManager
 from lyricist import LyricManager
 
@@ -31,25 +31,67 @@ log = logging.getLogger(__name__)
 # ── Информация об альбоме ────────────────────────────────────────────────────
 
 def album_info(folder: Path) -> tuple[str, str]:
-    """Возвращает (artist, album) из первого читаемого FLAC в папке.
+    """Возвращает (artist, album) релиза.
 
-    artist берётся из albumartist (или artist), только первый артист
-    (до первого '&'), чтобы поиск обложек был точнее.
+    Учитывает всех артистов альбома (из ALBUMARTIST или общих артистов треков),
+    не отсекая соавторов релиза.
     """
-    for f in sorted(folder.rglob("*.flac")):
+    flac_files = sorted(folder.rglob("*.flac"))
+    if not flac_files:
+        return folder.name, ""
+
+    album_artist_list: list[str] = []
+    album_name = ""
+    track_artists_sets: list[set[str]] = []
+    first_track_artists: list[str] = []
+
+    for f in flac_files:
         try:
             audio = FLAC(str(f))
-            artist = (
-                audio.get("albumartist", audio.get("artist", [""]))[0]
-                .split("&")[0]
-                .strip()
-            )
-            album = audio.get("album", [""])[0]
-            if artist or album:
-                return artist, album
+            if not album_name:
+                album_name = audio.get("album", [""])[0].strip()
+
+            if not album_artist_list and "albumartist" in audio:
+                album_artist_list = [a.strip() for a in audio["albumartist"] if a.strip()]
+
+            a_list = [a.strip() for a in audio.get("artist", []) if a.strip()]
+            if a_list:
+                if not first_track_artists:
+                    first_track_artists = a_list
+                track_artists_sets.append(set(a_list))
         except Exception:
             continue
-    return folder.name, ""
+
+    if album_artist_list:
+        if len(album_artist_list) == 2:
+            artist_str = " & ".join(album_artist_list)
+        else:
+            artist_str = ", ".join(album_artist_list)
+    elif track_artists_sets:
+        common = set.intersection(*track_artists_sets)
+        if common:
+            ordered_common = [a for a in first_track_artists if a in common]
+            if not ordered_common:
+                ordered_common = sorted(common, key=lambda s: s.casefold())
+            if len(ordered_common) == 2:
+                artist_str = " & ".join(ordered_common)
+            else:
+                artist_str = ", ".join(ordered_common)
+        else:
+            artist_str = ", ".join(first_track_artists) if first_track_artists else "Various Artists"
+    else:
+        artist_str = folder.name
+
+    if not album_name:
+        if " - " in folder.name:
+            parts = folder.name.split(" - ", 1)
+            if not artist_str or artist_str == folder.name:
+                artist_str = parts[0].strip()
+            album_name = parts[1].strip()
+        else:
+            album_name = folder.name
+
+    return artist_str, album_name
 
 
 def count_flacs(folder: Path) -> int:
@@ -123,17 +165,12 @@ def update_album_cover(folder: Path, cover: CoverCandidate) -> str:
             audio.clear_pictures()
             audio.add_picture(pic)
             if cover.date:
-                m_y = re.search(r"\b(\d{4})\b", cover.date)
-                cov_year = m_y.group(1) if m_y else cover.date[:4]
+                clean_cov_date = clean_date_str(cover.date)
                 existing_date = audio.get("date", [""])[0].strip()
-                existing_year = audio.get("year", [""])[0].strip()
-                if not existing_date or _date_is_more_specific(cover.date, existing_date):
-                    audio["date"] = [cover.date]
-                    audio["year"] = [cov_year]
-                elif len(existing_year) > 4:
-                    m_ey = re.search(r"\b(\d{4})\b", existing_year)
-                    if m_ey:
-                        audio["year"] = [m_ey.group(1)]
+                if not existing_date or _date_is_more_specific(clean_cov_date, existing_date):
+                    audio["date"] = [clean_cov_date]
+            if "year" in audio:
+                del audio["year"]
             audio.save()
         except Exception as e:
             log.warning("Не удалось обновить обложку в %s: %s", f.name, e)
@@ -300,29 +337,20 @@ def _date_is_more_specific(new_date: str, existing_date: str) -> bool:
 
 
 def _apply_date_to_flacs(folder: Path, date_str: str) -> None:
-    """Записывает дату в теги DATE/YEAR всех FLAC в папке (если новая специфичнее)."""
-    m = re.search(r"\b(\d{4})\b", date_str)
-    year = m.group(1) if m else date_str[:4]
+    """Записывает дату в тег DATE всех FLAC в папке (если новая специфичнее)."""
+    clean_date = clean_date_str(date_str)
     for f in folder.rglob("*.flac"):
         try:
             audio = FLAC(str(f))
             existing_date = audio.get("date", [""])[0].strip()
-            existing_year = audio.get("year", [""])[0].strip()
 
             changed = False
-            # Если в year записана полная дата вместо 4 цифр года — исправляем
-            if len(existing_year) > 4:
-                m_ey = re.search(r"\b(\d{4})\b", existing_year)
-                if m_ey:
-                    audio["year"] = [m_ey.group(1)]
-                    changed = True
-
-            if not existing_date or _date_is_more_specific(date_str, existing_date):
-                audio["date"] = [date_str]
-                audio["year"] = [year]
+            if "year" in audio:
+                del audio["year"]
                 changed = True
-            elif not existing_year and year:
-                audio["year"] = [year]
+
+            if not existing_date or _date_is_more_specific(clean_date, existing_date):
+                audio["date"] = [clean_date]
                 changed = True
 
             if changed:
@@ -534,12 +562,12 @@ def set_track_artists(track_path: Path, new_artists_str: str) -> list[str]:
     return artists_list
 
 
-# ── Определение Explicit (ITUNESADVISORY) ───────────────────────────────────
+# ── Определение Explicit (ITUNESADVISORY) и Лейбла (LABEL) ─────────────────
 
-def fetch_album_explicit_mapping(artist: str, album: str) -> dict[str, bool]:
-    """Ищет альбом в Deezer (с fallback на iTunes) и возвращает словарь {normalized_title: is_explicit}."""
+def fetch_album_online_metadata(artist: str, album: str) -> tuple[dict[str, bool], str]:
+    """Ищет альбом в Deezer (с fallback на iTunes) и возвращает ({normalized_title: is_explicit}, label)."""
     if not artist or not album:
-        return {}
+        return {}, ""
 
     def norm(s: str) -> str:
         return re.sub(r"[^\w]", "", s.lower())
@@ -568,7 +596,9 @@ def fetch_album_explicit_mapping(artist: str, album: str) -> dict[str, bool]:
                         headers={"User-Agent": "Mozilla/5.0"},
                     )
                     if alb_r.status_code == 200:
-                        tracks = alb_r.json().get("tracks", {}).get("data", [])
+                        alb_json = alb_r.json()
+                        label = (alb_json.get("label") or "").strip()
+                        tracks = alb_json.get("tracks", {}).get("data", [])
                         m: dict[str, bool] = {}
                         for tr in tracks:
                             t_title = tr.get("title", "")
@@ -576,10 +606,10 @@ def fetch_album_explicit_mapping(artist: str, album: str) -> dict[str, bool]:
                             is_exp = bool(tr.get("explicit_lyrics"))
                             m[norm(t_title)] = is_exp
                             m[norm(t_short)] = is_exp
-                        if m:
-                            return m
+                        if m or label:
+                            return m, label
         except Exception as e:
-            log.debug("Ошибка запроса explicit из Deezer для '%s': %s", q, e)
+            log.debug("Ошибка запроса метаданных из Deezer для '%s': %s", q, e)
 
     # 2. iTunes API fallback
     try:
@@ -593,6 +623,9 @@ def fetch_album_explicit_mapping(artist: str, album: str) -> dict[str, bool]:
             res = r.json().get("results", [])
             if res:
                 coll_id = res[0].get("collectionId")
+                raw_c = (res[0].get("copyright") or "").strip()
+                clean_lbl = re.sub(r"(?i)^[℗p©c\s\d\-–/]+", "", raw_c).strip()
+
                 r2 = httpx.get(
                     "https://itunes.apple.com/lookup",
                     params={"id": coll_id, "entity": "song"},
@@ -606,56 +639,78 @@ def fetch_album_explicit_mapping(artist: str, album: str) -> dict[str, bool]:
                             t_title = tr.get("trackName", "")
                             is_exp = (tr.get("trackExplicitness") == "explicit")
                             m[norm(t_title)] = is_exp
-                    if m:
-                        return m
+                    if m or clean_lbl:
+                        return m, clean_lbl
     except Exception as e:
-        log.debug("Ошибка запроса explicit из iTunes для '%s — %s': %s", artist, album, e)
+        log.debug("Ошибка запроса метаданных из iTunes для '%s — %s': %s", artist, album, e)
 
-    return {}
+    return {}, ""
 
 
-def enrich_album_explicit_tags(folder: Path, force: bool = False) -> int:
-    """Определяет explicit-статус треков через онлайн-каталоги и проставляет ITUNESADVISORY."""
+def enrich_album_online_metadata(folder: Path, force: bool = False) -> tuple[int, str]:
+    """Определяет explicit-статус треков (ITUNESADVISORY) и лейбл релиза (LABEL) через Deezer/iTunes."""
     flac_files = sorted(folder.rglob("*.flac"))
     if not flac_files:
-        return 0
+        return 0, ""
 
     artist, album = album_info(folder)
     if not artist or not album:
-        return 0
+        return 0, ""
 
-    mapping = fetch_album_explicit_mapping(artist, album)
-    if not mapping:
-        return 0
+    mapping, label = fetch_album_online_metadata(artist, album)
+    if not mapping and not label:
+        return 0, ""
 
     def norm(s: str) -> str:
         return re.sub(r"[^\w]", "", s.lower())
 
     marked_count = 0
+    label_applied = ""
+
     for f in flac_files:
         try:
             audio = FLAC(str(f))
-            if not force and "itunesadvisory" in audio:
-                continue
+            changed = False
 
-            title = audio.get("title", [f.stem])[0]
-            clean_t = re.sub(r"(?i)\s*[\(\[][^()\[\]]*(?:feat|ft)[^()\[\]]*[\)\]]", "", title).strip()
+            # 1. Простановка лейбла
+            if label:
+                existing_label = audio.get("label", [""])[0].strip()
+                if not existing_label or force:
+                    audio["label"] = [label]
+                    changed = True
+                    label_applied = label
 
-            is_exp = mapping.get(norm(title)) or mapping.get(norm(clean_t))
-            if is_exp:
-                audio["itunesadvisory"] = ["1"]
-                audio.save()
-                marked_count += 1
-            elif is_exp is False and force:
-                audio["itunesadvisory"] = ["0"]
+            # 2. Простановка ITUNESADVISORY (Explicit)
+            if force or "itunesadvisory" not in audio:
+                title = audio.get("title", [f.stem])[0]
+                clean_t = re.sub(r"(?i)\s*[\(\[][^()\[\]]*(?:feat|ft)[^()\[\]]*[\)\]]", "", title).strip()
+
+                is_exp = mapping.get(norm(title)) or mapping.get(norm(clean_t))
+                if is_exp:
+                    audio["itunesadvisory"] = ["1"]
+                    changed = True
+                    marked_count += 1
+                elif is_exp is False and force:
+                    audio["itunesadvisory"] = ["0"]
+                    changed = True
+
+            if changed:
                 audio.save()
         except Exception as e:
-            log.warning("Ошибка простановки explicit для %s: %s", f.name, e)
+            log.warning("Ошибка обогащения онлайн-метаданных для %s: %s", f.name, e)
 
     if marked_count > 0:
         log.info("Проставлен тег ITUNESADVISORY (Explicit) для %d треков в %s", marked_count, folder.name)
+    if label_applied:
+        log.info("Проставлен тег LABEL ('%s') для треков в %s", label_applied, folder.name)
 
-    return marked_count
+    return marked_count, label_applied
+
+
+def enrich_album_explicit_tags(folder: Path, force: bool = False) -> int:
+    """Обратная совместимость: возвращает количество треков с explicit."""
+    exp_count, _ = enrich_album_online_metadata(folder, force=force)
+    return exp_count
 
 
 # ── Пакетная идеализация библиотеки ──────────────────────────────────────────
@@ -745,8 +800,8 @@ def upgrade_album(
                     except Exception as e:
                         log.warning("Не удалось обновить ALBUMARTIST в %s: %s", f.name, e)
 
-    # Шаг 1.6: Онлайн-проверка Explicit-статуса через Deezer/iTunes (проставляем ITUNESADVISORY)
-    explicit_added = enrich_album_explicit_tags(album_dir, force=force)
+    # Шаг 1.6: Онлайн-проверка Explicit-статуса и лейбла через Deezer/iTunes
+    explicit_added, label_added = enrich_album_online_metadata(album_dir, force=force)
 
     # Шаг 2: Теперь берём гарантированно чистые artist и album для поиска обложки
     artist, album = album_info(album_dir)
@@ -756,8 +811,14 @@ def upgrade_album(
                 candidates = search_covers(artist, album)
                 if candidates:
                     chosen = candidates[0]
-                    update_album_cover(album_dir, chosen)
-                    cover_added = True
+                    if is_valid_cover_candidate(chosen, artist, album):
+                        update_album_cover(album_dir, chosen)
+                        cover_added = True
+                    else:
+                        log.warning(
+                            "Автоматический подбор обложки для '%s — %s': кандидат '%s — %s' не прошел валидацию названия. Обложка не изменена.",
+                            artist, album, chosen.artist, chosen.title
+                        )
             except Exception as e:
                 log.warning("Не удалось найти обложку для %s — %s: %s", artist, album, e)
 
@@ -793,6 +854,7 @@ def upgrade_album(
         "lyrics_added": lyrics_added,
         "replaygain_added": replaygain_added,
         "explicit_added": explicit_added,
+        "label": label_added,
     }
 
 
@@ -819,6 +881,7 @@ def upgrade_library(
     total_lyrics = 0
     total_rg = 0
     total_explicit = 0
+    total_labels = 0
     results = []
 
     for i, album_folder in enumerate(all_albums, 1):
@@ -834,6 +897,8 @@ def upgrade_library(
         if res.get("replaygain_added"):
             total_rg += 1
         total_explicit += res.get("explicit_added", 0)
+        if res.get("label"):
+            total_labels += 1
         results.append(res)
 
         if progress_callback:
@@ -849,6 +914,7 @@ def upgrade_library(
         "lyrics_added": total_lyrics,
         "replaygain_added": total_rg,
         "explicit_added": total_explicit,
+        "labels_added": total_labels,
         "force": force,
         "results": results,
     }

@@ -25,7 +25,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from pipeline import upgrade_album, album_has_cover
-from covers import search_covers
 
 
 def main() -> None:

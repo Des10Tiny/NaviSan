@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import requests
@@ -63,24 +65,99 @@ class CoverCandidate:
     release_url: str | None = None  # ссылка на страницу релиза
 
 
+# ── Сходство и ранжирование кандидатов ────────────────────────────────────────
+
+def _norm_str(s: str) -> str:
+    """Нормализует строку (только буквы и цифры в нижнем регистре)."""
+    return re.sub(r"[^\w]", "", (s or "").lower())
+
+
+def score_cover_candidate(
+    candidate: CoverCandidate,
+    target_artist: str,
+    target_album: str,
+) -> float:
+    """Оценивает соответствие кандидата обложки целевому релизу от 0.0 до 1.0.
+
+    Если название релиза в кандидате кардинально отличается от целевого альбома
+    (сходство < 0.45), возвращает 0.0 (чужой релиз).
+    """
+    cand_title = candidate.title or ""
+    cand_artist = candidate.artist or ""
+
+    norm_target_alb = _norm_str(target_album)
+    norm_cand_alb = _norm_str(cand_title)
+
+    if not norm_target_alb or not norm_cand_alb:
+        return 0.0
+
+    # 1. Сходство названия альбома
+    if norm_cand_alb == norm_target_alb:
+        title_score = 1.0
+    elif norm_target_alb in norm_cand_alb or norm_cand_alb in norm_target_alb:
+        title_score = 0.85
+    else:
+        title_score = SequenceMatcher(None, norm_target_alb, norm_cand_alb).ratio()
+
+    # Если название совсем не похоже, это чужой релиз другого альбома того же артиста
+    if title_score < 0.45:
+        return 0.0
+
+    # 2. Сходство артистов
+    target_tokens = [
+        _norm_str(t)
+        for t in re.split(r"[,;&]|\s+(?:feat\.?|ft\.?|with|x|and)\s+", target_artist, flags=re.I)
+        if len(_norm_str(t)) > 1
+    ]
+    cand_tokens = [
+        _norm_str(t)
+        for t in re.split(r"[,;&]|\s+(?:feat\.?|ft\.?|with|x|and)\s+", cand_artist, flags=re.I)
+        if len(_norm_str(t)) > 1
+    ]
+
+    matched_arts = 0
+    for tt in target_tokens:
+        for ct in cand_tokens:
+            if tt == ct or (len(tt) > 3 and tt in ct) or (len(ct) > 3 and ct in tt):
+                matched_arts += 1
+                break
+
+    if target_tokens:
+        if matched_arts == 0:
+            # Если в кандидате указан сборник (Various Artists / OST), даём невысокий балл
+            if any("variou" in ct or "soundtrack" in ct or ct == "va" for ct in cand_tokens):
+                art_score = 0.2
+            else:
+                # Совершенно другой артист (например, чужая песня с тем же названием)
+                return 0.0
+        else:
+            art_score = min(1.0, (matched_arts / len(target_tokens)) + 0.3)
+    else:
+        art_score = 0.5
+
+    return title_score * 0.7 + art_score * 0.3
+
+
+def is_valid_cover_candidate(
+    candidate: CoverCandidate,
+    target_artist: str,
+    target_album: str,
+    min_score: float = 0.65,
+) -> bool:
+    """Проверяет, подходит ли кандидат обложки для автоматической установки."""
+    return score_cover_candidate(candidate, target_artist, target_album) >= min_score
+
+
 # ── Поиск ────────────────────────────────────────────────────────────────────
 
-def search_covers(
+def _raw_search_covers(
     artist: str,
     album: str,
     *,
     country: str = DEFAULT_COUNTRY,
     sources: tuple[str, ...] = DEFAULT_SOURCES,
 ) -> list[CoverCandidate]:
-    """Ищет обложки альбома по всем указанным источникам.
-
-    Отправляет POST-запрос, читает NDJSON-поток до получения ``done`` от
-    каждого источника, дедуплицирует результаты по ``big_url``.
-
-    Возвращает пустой список при сетевых ошибках или если ничего не найдено.
-    Если один из источников завис и вызвал таймаут между строками — возвращает
-    то, что успело прийти от остальных.
-    """
+    """Выполняет один одиночный HTTP POST запрос к covers.musichoarders.xyz."""
     session_id = uuid.uuid4().hex
 
     headers = {
@@ -98,7 +175,7 @@ def search_covers(
         "sources": list(sources),
     }
 
-    log.info("Поиск обложек: %s — %s (источники: %s)", artist, album, ", ".join(sources))
+    log.info("Запрос covers API: '%s' — '%s' (источники: %s)", artist, album, ", ".join(sources))
 
     try:
         resp = requests.post(
@@ -159,7 +236,6 @@ def search_covers(
                     break
 
     except requests.exceptions.Timeout:
-        # Один из источников завис — возвращаем, что успело прийти.
         remaining = ", ".join(sources_pending) or "—"
         log.warning("Таймаут потока, не дождались: %s. Возвращаем %d кандидатов.", remaining, len(candidates))
 
@@ -169,9 +245,85 @@ def search_covers(
     finally:
         resp.close()
 
-    ordered = reorder_candidates_round_robin(candidates, sources)
-    log.info("Найдено %d кандидатов (упорядочены round-robin)", len(ordered))
-    return ordered
+    return candidates
+
+
+def search_covers(
+    artist: str,
+    album: str,
+    *,
+    country: str = DEFAULT_COUNTRY,
+    sources: tuple[str, ...] = DEFAULT_SOURCES,
+) -> list[CoverCandidate]:
+    """Ищет обложки альбома по всем источникам с интеллектуальной фильтрацией и ранжированием.
+
+    - Поддерживает мультиартист релизы (пробует полный состав и фолбэки по ключевым соавторам).
+    - Оценивает релевантность кандидатов названию альбома и артистам.
+    - Отсекает нерелевантные релизы (счет 0.0), чтобы чужие альбомы не попали в результат.
+    - Упорядочивает кандидатов Round-Robin среди наиболее релевантных совпадений.
+    """
+    if not artist or not album:
+        return []
+
+    # Формируем список поисковых запросов для артиста
+    tokens = [
+        t.strip()
+        for t in re.split(r"[,;&]|\s+(?:feat\.?|ft\.?|with|x|and)\s+", artist, flags=re.I)
+        if t.strip()
+    ]
+    queries = [artist]
+    if len(tokens) >= 2:
+        pair = f"{tokens[0]} & {tokens[1]}"
+        if pair not in queries:
+            queries.append(pair)
+        pair_comma = f"{tokens[0]}, {tokens[1]}"
+        if pair_comma not in queries:
+            queries.append(pair_comma)
+    for tok in tokens:
+        if tok not in queries:
+            queries.append(tok)
+
+    all_candidates: list[CoverCandidate] = []
+    seen_urls: set[str] = set()
+
+    for q_idx, q_artist in enumerate(queries):
+        raw_cands = _raw_search_covers(q_artist, album, country=country, sources=sources)
+        new_high_matches = 0
+        for c in raw_cands:
+            if not c.big_url or c.big_url in seen_urls:
+                continue
+            seen_urls.add(c.big_url)
+            score = score_cover_candidate(c, artist, album)
+            if score > 0.4:
+                all_candidates.append(c)
+                if score >= 0.7:
+                    new_high_matches += 1
+
+        # Если уже на первом или текущем запросе нашли как минимум 2 отличных совпадения
+        # (или 1 с высоким баллом для соло-артиста), дальнейшие запросы не нужны
+        if new_high_matches >= 2 or (q_idx == 0 and new_high_matches >= 1 and len(tokens) <= 1):
+            break
+
+    if not all_candidates:
+        log.warning("Поиск обложек: для '%s — %s' не найдено релевантных обложек", artist, album)
+        return []
+
+    # Ранжируем кандидатов по баллам и группируем по тирам релевантности
+    scored_candidates = [(score_cover_candidate(c, artist, album), c) for c in all_candidates]
+    scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+    high_tier = [c for s, c in scored_candidates if s >= 0.65]
+    med_tier = [c for s, c in scored_candidates if 0.4 <= s < 0.65]
+
+    ordered_high = reorder_candidates_round_robin(high_tier, sources)
+    ordered_med = reorder_candidates_round_robin(med_tier, sources)
+
+    result = ordered_high + ordered_med
+    log.info(
+        "Найдено %d релевантных кандидатов для '%s — %s' (топ: %d)",
+        len(result), artist, album, len(high_tier)
+    )
+    return result
 
 
 def reorder_candidates_round_robin(
