@@ -23,14 +23,15 @@ RUN groupadd --gid 1000 navisan \
 
 WORKDIR /app
 
-# Сначала только requirements.txt — чтобы слой с зависимостями кэшировался
-# и не пересобирался при изменении кода
-COPY requirements.txt .
+# 1. Системный пакет flac (metaflac для ReplayGain).
+# Устанавливается точечно с --no-install-recommends и кэшируется намертво.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     flac \
- && rm -rf /var/lib/apt/lists/* \
- && pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
+ && rm -rf /var/lib/apt/lists/*
+
+# 2. Python-зависимости (кэшируются, пока requirements.txt не меняется)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Копируем исходный код
 COPY *.py ./
