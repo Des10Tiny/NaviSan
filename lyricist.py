@@ -37,36 +37,6 @@ class LyricResult:
 
 # ── Вспомогательные функции ──────────────────────────────────────────────────
 
-# Паттерн для технических метаданных азиатских платформ (NetEase/KuGou) и служебных тегов LRC
-METADATA_LINE_RE = re.compile(
-    r"^(?:"
-    r"\[(?:ar|al|ti|au|by|offset|length|re|ve):.*\]|"
-    r"(?:作词|作曲|编曲|制作人|录音|混音|母带|吉他|贝斯|鼓|键盘|和声|弦乐|策划|监制|企划|发行)\s*[:：].*|"
-    r"(?:lyrics\s*by|written\s*by|composed\s*by|produced\s*by|arranged\s*by)\s*[:：].*|"
-    r"(?:qq音乐|网易云音乐|酷狗音乐).*"
-    r")$",
-    re.IGNORECASE,
-)
-
-
-def strip_lyrics_metadata(text: str) -> str:
-    """Удаляет из текста песни технические метаданные азиатских баз (NetEase/KuGou) и служебные теги LRC."""
-    if not text:
-        return ""
-    out: list[str] = []
-    for line in text.split("\n"):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        content = re.sub(r"^\[\d{2}:\d{2}(?:\.\d+)?\]\s*", "", stripped).strip()
-        if not content:
-            continue
-        if METADATA_LINE_RE.match(content):
-            continue
-        out.append(line)
-    return "\n".join(out).strip()
-
-
 def has_timestamps(text: str) -> bool:
     """Проверяет, содержит ли текст временные метки караоке вида [mm:ss.xx]."""
     return bool(re.search(r"\[\d{2}:\d{2}", text))
@@ -124,8 +94,8 @@ class LyricManager:
             )
             if r.status_code == 200:
                 data = r.json()
-                synced = strip_lyrics_metadata(data.get("syncedLyrics") or "")
-                plain = strip_lyrics_metadata(data.get("plainLyrics") or "")
+                synced = data.get("syncedLyrics")
+                plain = data.get("plainLyrics")
                 res_synced = (
                     LyricResult(text=synced, is_synced=True, source="lrclib", track_title=title, artist=artist)
                     if synced
@@ -169,8 +139,8 @@ class LyricManager:
                             if title.lower() not in api_title:
                                 continue
 
-                            synced = strip_lyrics_metadata(item.get("syncedLyrics") or "")
-                            plain = strip_lyrics_metadata(item.get("plainLyrics") or "")
+                            synced = item.get("syncedLyrics")
+                            plain = item.get("plainLyrics")
                             if synced:
                                 return (
                                     LyricResult(text=synced, is_synced=True, source="lrclib", track_title=title, artist=artist),
@@ -314,7 +284,7 @@ class LyricManager:
 
             full_text = "\n".join(c.get_text() for c in containers)
             full_text = re.sub(r"\n{3,}", "\n\n", full_text)
-            full_text = strip_lyrics_metadata(re.sub(r"\d*Embed$", "", full_text.strip()))
+            full_text = re.sub(r"\d*Embed$", "", full_text.strip())
 
             if full_text.strip():
                 return LyricResult(
@@ -375,8 +345,10 @@ class LyricManager:
                         elif txt:
                             out.append(txt)
 
-                    full_text = strip_lyrics_metadata("\n".join(out))
+                    full_text = "\n".join(out).strip()
                     if full_text:
+                        from aligner import clean_lyrics_metadata
+                        full_text = clean_lyrics_metadata(full_text)
                         return LyricResult(
                             text=full_text,
                             is_synced=has_sync,
@@ -409,17 +381,17 @@ class LyricManager:
             TimeoutSession.request = _custom_timeout_request
 
             # Ищем исключительно синхронизированный текст (с таймкодами)
-            raw_lrc = syncedlyrics.search(search_query, synced_only=True)
-            if raw_lrc:
-                lrc_text = strip_lyrics_metadata(raw_lrc)
-                if lrc_text and has_timestamps(lrc_text):
-                    return LyricResult(
-                        text=lrc_text,
-                        is_synced=True,
-                        source="syncedlyrics",
-                        track_title=title,
-                        artist=artist,
-                    )
+            lrc_text = syncedlyrics.search(search_query, synced_only=True)
+            if lrc_text and has_timestamps(lrc_text):
+                from aligner import clean_lyrics_metadata
+                clean_lrc = clean_lyrics_metadata(lrc_text.strip())
+                return LyricResult(
+                    text=clean_lrc,
+                    is_synced=True,
+                    source="syncedlyrics",
+                    track_title=title,
+                    artist=artist,
+                )
         except Exception as e:
             log.debug("syncedlyrics error for '%s — %s': %s", artist, title, e)
 
@@ -593,8 +565,8 @@ class LyricManager:
                 # Если уже есть таймкоды — очищаем их, чтобы получить чистый текст для выравнивания
                 lines = []
                 for l in content.split("\n"):
-                    cleaned = re.sub(r"\[\d{2}:\d{2}(?:\.\d+)?\]\s*", "", l).strip()
-                    if cleaned and not METADATA_LINE_RE.match(cleaned):
+                    cleaned = re.sub(r"\[\d{2}:\d{2}\.\d+\]\s*", "", l).strip()
+                    if cleaned:
                         lines.append(cleaned)
                 plain_text = "\n".join(lines)
             except Exception as e:
@@ -641,7 +613,8 @@ class LyricManager:
 
     def save_manual_lyrics(self, lrc_path: Path, text: str) -> LyricResult:
         """Сохраняет вручную введённый текст в файл .lrc."""
-        text = strip_lyrics_metadata(text.strip())
+        from aligner import clean_lyrics_metadata
+        text = clean_lyrics_metadata(text.strip())
         is_sync = has_timestamps(text)
         lrc_path.write_text(text, encoding="utf-8")
         try:

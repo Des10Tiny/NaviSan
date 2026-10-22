@@ -13,6 +13,7 @@ python-telegram-bot==22.8
 rapidfuzz==3.14.6
 requests==2.34.2
 soupsieve==3.0.3
+syncalong==2.0.1
 syncedlyrics==1.0.1
 typing_extensions==4.16.0
 urllib3==2.8.0
