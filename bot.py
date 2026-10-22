@@ -2084,7 +2084,8 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         track_path = tracks[idx]
         try:
             audio = FLAC(str(track_path))
-            artist = audio.get("artist", audio.get("albumartist", [""]))[0]
+            arts = audio.get("artist", [])
+            artist = ", ".join(arts) if arts else audio.get("albumartist", [""])[0]
             title = audio.get("title", [""])[0]
             album = audio.get("album", [""])[0]
             duration = int(audio.info.length) if hasattr(audio.info, "length") else 0
@@ -2292,7 +2293,8 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                 _on_albmiss_progress(i + 1, len(missing_tracks), tr.name)
                 try:
                     audio = FLAC(str(tr))
-                    artist = audio.get("artist", audio.get("albumartist", [""]))[0]
+                    arts = audio.get("artist", [])
+                    artist = ", ".join(arts) if arts else audio.get("albumartist", [""])[0]
                     title = audio.get("title", [""])[0]
                     album = audio.get("album", [""])[0]
                     dur = int(audio.info.length) if hasattr(audio.info, "length") else 0
@@ -2392,7 +2394,8 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
                     try:
                         audio = FLAC(str(tr))
-                        artist = audio.get("artist", audio.get("albumartist", [""]))[0]
+                        arts = audio.get("artist", [])
+                        artist = ", ".join(arts) if arts else audio.get("albumartist", [""])[0]
                         title = audio.get("title", [""])[0]
                         alb = audio.get("album", [""])[0] or tr.parent.name
                     except Exception:
@@ -2467,7 +2470,8 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
         try:
             audio = FLAC(str(track_path))
-            artist = audio.get("artist", [""])[0]
+            arts = audio.get("artist", [])
+            artist = ", ".join(arts) if arts else audio.get("albumartist", [""])[0]
             title = audio.get("title", [""])[0]
         except Exception:
             artist, title = "", track_path.stem

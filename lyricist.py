@@ -514,7 +514,8 @@ class LyricManager:
 
         try:
             audio = FLAC(str(path))
-            artist = audio.get("artist", audio.get("albumartist", [""]))[0]
+            arts = audio.get("artist", [])
+            artist = ", ".join(arts) if arts else audio.get("albumartist", [""])[0]
             title = audio.get("title", [""])[0]
             album = audio.get("album", [""])[0]
             duration = int(audio.info.length) if hasattr(audio.info, "length") else 0
@@ -589,26 +590,42 @@ class LyricManager:
             except Exception as e:
                 log.debug("Ошибка чтения lrc %s: %s", lrc_path, e)
 
+        audio_artist = ""
+        audio_title = ""
+        try:
+            audio = FLAC(str(path))
+            arts = audio.get("artist", [])
+            audio_artist = ", ".join(arts) if arts else audio.get("albumartist", [""])[0]
+            audio_title = audio.get("title", [""])[0]
+        except Exception as e:
+            log.debug("Ошибка получения тегов трека %s: %s", path, e)
+
         # 2. Если текста не было, скачиваем с Genius/водопада
         if not plain_text:
-            try:
-                audio = FLAC(str(path))
-                artist = audio.get("artist", audio.get("albumartist", [""]))[0]
-                title = audio.get("title", [""])[0]
-                if artist and title:
-                    res = self._fetch_genius(artist, title) or self._fetch_lrcmux(artist, title)
-                    if res and res.text:
-                        plain_text = res.text
-            except Exception as e:
-                log.debug("Ошибка получения тегов трека %s: %s", path, e)
+            if audio_artist and audio_title:
+                res = self._fetch_genius(audio_artist, audio_title) or self._fetch_lrcmux(audio_artist, audio_title)
+                if res and res.text:
+                    plain_text = res.text
 
         if not plain_text.strip():
             return None, "Текст песни не найден ни в файле, ни на Genius"
 
-        # 3. Выравнивание через faster-whisper
+        # 3. Выравнивание через faster-whisper + lyric-align
         try:
             from aligner import align_lyrics
             synced_text = align_lyrics(path, plain_text, model=model)
+
+            # Если выравнивание локального текста из .lrc не сошлось (текст чужой),
+            # пробуем перезапросить свежий эталонный текст с Genius
+            if (not synced_text or not has_timestamps(synced_text)) and audio_artist and audio_title:
+                log.info("Локальный текст .lrc не совпал с аудио. Пробуем перекачать с Genius: %s — %s", audio_artist, audio_title)
+                fresh_res = self._fetch_genius(audio_artist, audio_title) or self._fetch_lrcmux(audio_artist, audio_title)
+                if fresh_res and fresh_res.text and fresh_res.text.strip() != plain_text.strip():
+                    log.info("Найден альтернативный текст на Genius. Повторный запуск выравнивания...")
+                    retry_synced = align_lyrics(path, fresh_res.text, model=model)
+                    if retry_synced and has_timestamps(retry_synced):
+                        synced_text = retry_synced
+
             if synced_text and has_timestamps(synced_text):
                 lrc_path.write_text(synced_text, encoding="utf-8")
                 try:
