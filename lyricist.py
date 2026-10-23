@@ -641,93 +641,6 @@ class LyricManager:
             log.error("Ошибка при обработке текста для %s: %s", path.name, e)
             return f"Ошибка: {e}"
 
-    def ai_align_track(self, flac_path: str | Path, model: any = None) -> tuple[LyricResult | None, str]:
-        """Выполняет нейро-выравнивание текста по аудиофайлу трека (Forced Alignment).
-
-        1. Берёт существующий plain-текст из .lrc (если он уже скачан с Genius).
-        2. Если текста нет, скачивает plain-текст через водопад (Genius / lrcmux).
-        3. Запускает align_lyrics() для расстановки таймкодов.
-        4. Сохраняет обновлённый синхронизированный .lrc файл.
-
-        Returns:
-            (LyricResult, "Сообщение о статусе")
-        """
-        path = Path(flac_path)
-        if not path.exists() or path.suffix.lower() != ".flac":
-            return None, "Файл не найден или не является FLAC"
-
-        lrc_path = path.with_suffix(".lrc")
-        plain_text = ""
-
-        # 1. Проверяем существующий файл .lrc
-        if lrc_path.exists():
-            try:
-                content = lrc_path.read_text(encoding="utf-8").strip()
-                # Если уже есть таймкоды — очищаем их, чтобы получить чистый текст для выравнивания
-                lines = []
-                for l in content.split("\n"):
-                    cleaned = re.sub(r"\[\d{2}:\d{2}\.\d+\]\s*", "", l).strip()
-                    if cleaned:
-                        lines.append(cleaned)
-                plain_text = "\n".join(lines)
-            except Exception as e:
-                log.debug("Ошибка чтения lrc %s: %s", lrc_path, e)
-
-        audio_artist = ""
-        audio_title = ""
-        try:
-            audio = FLAC(str(path))
-            arts = audio.get("artist", [])
-            audio_artist = ", ".join(arts) if arts else audio.get("albumartist", [""])[0]
-            audio_title = audio.get("title", [""])[0]
-        except Exception as e:
-            log.debug("Ошибка получения тегов трека %s: %s", path, e)
-
-        # 2. Если текста не было, скачиваем с Genius/водопада
-        if not plain_text:
-            if audio_artist and audio_title:
-                res = self._fetch_genius(audio_artist, audio_title) or self._fetch_lrcmux(audio_artist, audio_title)
-                if res and res.text:
-                    plain_text = res.text
-
-        if not plain_text.strip():
-            return None, "Текст песни не найден ни в файле, ни на Genius"
-
-        # 3. Выравнивание через faster-whisper + lyric-align
-        try:
-            from aligner import align_lyrics
-            synced_text = align_lyrics(path, plain_text, model=model)
-
-            # Если выравнивание локального текста из .lrc не сошлось (текст чужой),
-            # пробуем перезапросить свежий эталонный текст с Genius
-            if (not synced_text or not has_timestamps(synced_text)) and audio_artist and audio_title:
-                log.info("Локальный текст .lrc не совпал с аудио. Пробуем перекачать с Genius: %s — %s", audio_artist, audio_title)
-                fresh_res = self._fetch_genius(audio_artist, audio_title) or self._fetch_lrcmux(audio_artist, audio_title)
-                if fresh_res and fresh_res.text and fresh_res.text.strip() != plain_text.strip():
-                    log.info("Найден альтернативный текст на Genius. Повторный запуск выравнивания...")
-                    retry_synced = align_lyrics(path, fresh_res.text, model=model)
-                    if retry_synced and has_timestamps(retry_synced):
-                        synced_text = retry_synced
-
-            if synced_text and has_timestamps(synced_text):
-                lrc_path.write_text(synced_text, encoding="utf-8")
-                try:
-                    lrc_path.chmod(0o664)
-                    os.utime(str(path), None)
-                except Exception:
-                    pass
-                res = LyricResult(
-                    text=synced_text,
-                    is_synced=True,
-                    source="ai",
-                    track_title=path.stem,
-                )
-                return res, "Таймкоды успешно расставлены нейросетью ✨"
-            return None, "Нейросети не удалось сопоставить слова с аудио (текст не совпадает с песней)"
-        except Exception as e:
-            log.error("Ошибка при AI-выравнивании %s: %s", path.name, e)
-            return None, f"Ошибка нейросети: {e}"
-
     def save_manual_lyrics(self, lrc_path: Path, text: str) -> LyricResult:
         """Сохраняет вручную введённый текст в файл .lrc."""
         text = text.strip()
@@ -750,9 +663,9 @@ def audit_library_lyrics(library_dir: str | Path) -> dict:
         Словарь с ключами:
         - total: общее число FLAC треков
         - synced: список Path треков с синхронизированным .lrc
-        - plain: список Path треков с обычным текстом .lrc (готовы к AI-выравниванию)
+        - plain: список Path треков с обычным текстом .lrc (plain)
         - missing: список Path треков без .lrc
-        - albums_plain: словарь {album_dir_name: [Path, ...]} для удобного пакетного выравнивания
+        - albums_plain: словарь {album_dir_name: [Path, ...]} для альбомов с обычным текстом
     """
     root = Path(library_dir)
     if not root.exists():
