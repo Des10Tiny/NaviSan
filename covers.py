@@ -39,7 +39,15 @@ YANDEX_API_URL = "https://api.music.yandex.net/search"
 
 # Apple Music исключён: CDN отдаёт WebP под расширением .jpg (ADR-0012).
 # yandex опрашивается напрямую через API Яндекс Музыки.
-DEFAULT_SOURCES: tuple[str, ...] = ("yandex", "spotify", "deezer", "tidal", "amazonmusic")
+DEFAULT_SOURCES: tuple[str, ...] = (
+    "yandex",
+    "spotify",
+    "deezer",
+    "tidal",
+    "amazonmusic",
+    "discogs",
+    "musicbrainz",
+)
 DEFAULT_COUNTRY = "us"
 
 _BROWSER_UA = (
@@ -162,6 +170,10 @@ def is_valid_cover_candidate(
 
 # ── Поиск Яндекс Музыки ──────────────────────────────────────────────────────
 
+class YandexGeoblockError(Exception):
+    """Вызывается при получении HTTP 451 от Яндекс Музыки (геоблокировка)."""
+
+
 def _build_yandex_cover_url(cover_uri: str, size: str) -> str:
     """Формирует URL обложки Яндекс Музыки заданного размера (напр. 'm1000x1000' или '400x400')."""
     if "%%" in cover_uri:
@@ -184,7 +196,7 @@ def _search_yandex_covers(
     Если сервер находится за пределами РФ/СНГ, для обхода ошибки 451
     используется OAuth-токен (параметр YANDEX_MUSIC_TOKEN в .env).
     """
-    if not artist or not album:
+    if not album:
         return []
 
     if token is None:
@@ -193,11 +205,12 @@ def _search_yandex_covers(
     headers = {
         "User-Agent": _BROWSER_UA,
         "Accept": "application/json",
+        "X-Yandex-Music-Client": "YandexMusicAndroid/24023621",
     }
     if token:
         headers["Authorization"] = f"OAuth {token}"
 
-    query = f"{artist} {album}".strip()
+    query = f"{artist} {album}".strip() if artist else album.strip()
     params = {
         "text": query,
         "type": "album",
@@ -214,24 +227,25 @@ def _search_yandex_covers(
             timeout=(_CONNECT_TIMEOUT, _STREAM_TIMEOUT),
         )
         if resp.status_code == 451:
-            log.debug(
+            log.warning(
                 "Yandex Music API вернул 451 (геоблокировка). "
-                "Для работы из-за рубежа укажите YANDEX_MUSIC_TOKEN в .env"
+                "Запрос отклонён Яндексом! Укажите YANDEX_MUSIC_TOKEN в .env для работы из-за рубежа."
             )
-            return []
+            raise YandexGeoblockError()
         if resp.status_code == 401:
             log.warning("Yandex Music API: 401 Unauthorized (проверьте YANDEX_MUSIC_TOKEN в .env)")
             return []
         resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as exc:
-        log.debug("Ошибка запроса к Yandex Music API: %s", exc)
+        log.warning("Ошибка запроса к Yandex Music API: %s", exc)
         return []
 
     result = data.get("result", {})
     albums_data = result.get("albums", {})
     albums = albums_data.get("results") or albums_data.get("items") or []
     if not albums:
+        log.info("Yandex Music: по запросу '%s' ничего не найдено", query)
         return []
 
     candidates: list[CoverCandidate] = []
@@ -285,6 +299,7 @@ def _search_yandex_covers(
         candidates.append(candidate)
         log.debug("  ← yandex: %s — %s (%s)", candidate.artist, candidate.title, candidate.date or "—")
 
+    log.info("Yandex Music: получено %d кандидатов для '%s'", len(candidates), query)
     return candidates
 
 
@@ -417,12 +432,14 @@ def search_covers(
     ]
     queries = [artist]
     if len(tokens) >= 2:
-        pair = f"{tokens[0]} & {tokens[1]}"
-        if pair not in queries:
-            queries.append(pair)
-        pair_comma = f"{tokens[0]}, {tokens[1]}"
-        if pair_comma not in queries:
-            queries.append(pair_comma)
+        for i in range(len(tokens)):
+            for j in range(i + 1, len(tokens)):
+                p = f"{tokens[i]} & {tokens[j]}"
+                if p not in queries:
+                    queries.append(p)
+                p_comma = f"{tokens[i]}, {tokens[j]}"
+                if p_comma not in queries:
+                    queries.append(p_comma)
     for tok in tokens:
         if tok not in queries:
             queries.append(tok)
@@ -432,20 +449,49 @@ def search_covers(
 
     # 1. Поиск через API Яндекс Музыки
     if "yandex" in sources:
-        yandex_cands = _search_yandex_covers(artist, album)
-        if not yandex_cands and len(tokens) >= 2:
-            yandex_cands = _search_yandex_covers(tokens[0], album)
-        for c in yandex_cands:
-            if not c.big_url or c.big_url in seen_urls:
-                continue
-            seen_urls.add(c.big_url)
-            score = score_cover_candidate(c, artist, album)
-            if score > 0.4:
-                all_candidates.append(c)
+        yandex_queries = list(queries)
+        clean_art = re.sub(r"&", " ", artist).strip()
+        if clean_art not in yandex_queries:
+            yandex_queries.insert(1, clean_art)
 
-    # 2. Поиск через MusicHoarders (Deezer, Spotify, Tidal, Amazon)
+        found_good_yandex = False
+        try:
+            for y_artist in yandex_queries:
+                yandex_raw = _search_yandex_covers(y_artist, album)
+                for c in yandex_raw:
+                    if not c.big_url or c.big_url in seen_urls:
+                        continue
+                    seen_urls.add(c.big_url)
+                    score = score_cover_candidate(c, artist, album)
+                    if score > 0.4:
+                        all_candidates.append(c)
+                        log.info("  ✓ yandex: %s — %s (балл: %.2f)", c.artist, c.title, score)
+                        if score >= 0.7:
+                            found_good_yandex = True
+                    else:
+                        log.debug("  ✗ yandex (отклонён, балл %.2f): %s — %s", score, c.artist, c.title)
+
+                if found_good_yandex:
+                    break
+
+            # Если поиск по артисту не дал результатов, пробуем прямой поиск по названию альбома
+            if not found_good_yandex:
+                yandex_raw = _search_yandex_covers("", album)
+                for c in yandex_raw:
+                    if not c.big_url or c.big_url in seen_urls:
+                        continue
+                    seen_urls.add(c.big_url)
+                    score = score_cover_candidate(c, artist, album)
+                    if score > 0.4:
+                        all_candidates.append(c)
+                        log.info("  ✓ yandex (по названию альбома): %s — %s (балл: %.2f)", c.artist, c.title, score)
+        except YandexGeoblockError:
+            pass
+
+    # 2. Поиск через MusicHoarders (Deezer, Spotify, Tidal, Amazon, Discogs, MusicBrainz)
     mh_sources = tuple(s for s in sources if s != "yandex")
     if mh_sources:
+        total_high_matches = 0
         for q_idx, q_artist in enumerate(queries):
             raw_cands = _raw_search_covers(q_artist, album, country=country, sources=mh_sources)
             new_high_matches = 0
@@ -458,11 +504,24 @@ def search_covers(
                     all_candidates.append(c)
                     if score >= 0.7:
                         new_high_matches += 1
+                        total_high_matches += 1
 
             # Если уже на первом или текущем запросе нашли как минимум 2 отличных совпадения
             # (или 1 с высоким баллом для соло-артиста), дальнейшие запросы не нужны
             if new_high_matches >= 2 or (q_idx == 0 and new_high_matches >= 1 and len(tokens) <= 1):
                 break
+
+        # Если поиск по артистам не дал ни одного высокого совпадения,
+        # пробуем запрос чисто по названию альбома (для уникальных названий вроде "Умшакалака")
+        if total_high_matches == 0:
+            raw_cands = _raw_search_covers("", album, country=country, sources=mh_sources)
+            for c in raw_cands:
+                if not c.big_url or c.big_url in seen_urls:
+                    continue
+                seen_urls.add(c.big_url)
+                score = score_cover_candidate(c, artist, album)
+                if score > 0.4:
+                    all_candidates.append(c)
 
     if not all_candidates:
         log.warning("Поиск обложек: для '%s — %s' не найдено релевантных обложек", artist, album)
