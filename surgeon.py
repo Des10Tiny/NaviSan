@@ -216,7 +216,7 @@ class FLACSurgeon:
         if clean_orig and clean_orig != raw_orig:
             audio["originaldate"] = [clean_orig]
 
-        # Выбираем наиболее полную дату: если риппер записал дату в YEAR, переносим в DATE
+        # Выбираем наиболее полную дату
         best_full_date = ""
         if len(clean_year) > len(clean_date):
             best_full_date = clean_year
@@ -225,10 +225,10 @@ class FLACSurgeon:
         elif clean_orig:
             best_full_date = clean_orig
 
-        # Извлекаем 4-значный год, если полная дата отсутствует
+        # Извлекаем 4-значный год для стандартного тега DATE (стандарт Vorbis Comment)
         year_4_digits = ""
-        if not best_full_date:
-            for cand in (clean_year, clean_date, clean_orig, raw_year, raw_date):
+        for cand in (best_full_date, clean_year, clean_date, clean_orig, raw_year, raw_date):
+            if cand:
                 m = re.search(r"\b(19\d{2}|20\d{2})\b", cand)
                 if not m:
                     m = re.search(r"\b(\d{4})\b", cand)
@@ -236,13 +236,20 @@ class FLACSurgeon:
                     year_4_digits = m.group(1)
                     break
 
-        # В FLAC пишем исключительно стандартный тег DATE
-        if best_full_date:
-            audio["date"] = [best_full_date]
-        elif year_4_digits:
+        # В FLAC тег DATE должен содержать 4 цифры года (YYYY),
+        # чтобы в плеерах и теггерах (Mp3tag, Navidrome) колонка "Year" отображала строго год,
+        # а полную дату (YYYY-MM-DD) сохраняем в ORIGINALDATE.
+        if year_4_digits:
             audio["date"] = [year_4_digits]
+        elif best_full_date:
+            audio["date"] = [best_full_date]
         elif "date" in audio:
             del audio["date"]
+
+        if len(best_full_date) > 4:
+            audio["originaldate"] = [best_full_date]
+        elif clean_orig and clean_orig != raw_orig:
+            audio["originaldate"] = [clean_orig]
 
         # Тег YEAR исключён: стандартом FLAC/Vorbis Comment является только DATE
         if "year" in audio:

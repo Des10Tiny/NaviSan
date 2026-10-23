@@ -20,6 +20,20 @@ import httpx
 log = logging.getLogger(__name__)
 
 
+VARIOUS_ARTISTS_NAMES: frozenset[str] = frozenset({
+    "various artists",
+    "various",
+    "va",
+    "v/a",
+    "v.a.",
+    "soundtrack",
+    "ost",
+    "vários artistas",
+    "varios artistas",
+    "multi-interprètes",
+})
+
+
 def is_safe_match(query: str, candidate: str) -> bool:
     """Проверяет безопасность замены артиста через fuzzy matching.
 
@@ -98,6 +112,9 @@ class TagSanitizer:
         name_clean = artist_name.strip()
         if not name_clean:
             return None
+
+        if name_clean.lower() in VARIOUS_ARTISTS_NAMES:
+            return "Various Artists"
 
         # 1. Deezer API (официальный каталог лейблов, быстрый и точный)
         try:
@@ -203,8 +220,11 @@ class TagSanitizer:
         if not raw_str:
             return []
 
-        # 1. Быстрая проверка: полное совпадение с кешем или базой Navidrome
         raw_lower = raw_str.lower()
+        if raw_lower in VARIOUS_ARTISTS_NAMES:
+            return ["Various Artists"]
+
+        # 1. Быстрая проверка: полное совпадение с кешем или базой Navidrome
         if raw_lower in self.artists_cache and self.artists_cache[raw_lower]:
             return [self.artists_cache[raw_lower]]
         db_match = self._get_artist_from_db(raw_str)
@@ -242,6 +262,9 @@ class TagSanitizer:
                     artist = artist.replace(tok, orig)
 
             artist_lower = artist.lower()
+            if artist_lower in VARIOUS_ARTISTS_NAMES:
+                clean_artists.append("Various Artists")
+                continue
 
             # 1. Приоритет: результат из локального кеша онлайн-проверок
             if artist_lower in self.artists_cache:

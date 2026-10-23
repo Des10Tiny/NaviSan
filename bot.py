@@ -30,7 +30,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, TimedOut, TelegramError
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -61,6 +61,7 @@ from pipeline import (
     replace_all_tracks_artist,
     set_track_artists,
     upgrade_library,
+    enrich_single_track_release,
 )
 from watcher import watch_inbox
 
@@ -237,6 +238,13 @@ async def _send_native_slideshow(
 
 async def _on_new_release(folder: Path, app: Application, is_recover: bool = False) -> None:
     """Запускает поиск обложек и открывает нативный слайдшоу."""
+    if not is_recover and count_flacs(folder) == 1:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, lambda: enrich_single_track_release(folder))
+        except Exception as e:
+            log.warning("Ошибка enrich_single_track_release для %s: %s", folder.name, e)
+
     artist, album = album_info(folder)
     n_tracks = count_flacs(folder)
 
@@ -1041,7 +1049,7 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 
 async def _safe_edit_message(query, text: str, reply_markup=None, parse_mode="Markdown") -> None:
     """Редактирует сообщение, безопасно игнорируя 'Message is not modified' и обрабатывая ограничения Telegram."""
-    from telegram.error import BadRequest, RetryAfter, TelegramError
+    from telegram.error import RetryAfter
     try:
         await query.edit_message_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
     except BadRequest as e:
@@ -1057,6 +1065,24 @@ async def _safe_edit_message(query, text: str, reply_markup=None, parse_mode="Ma
             log.warning("Ошибка повторного редактирования сообщения: %s", e2)
     except TelegramError as e:
         log.warning("TelegramError при редактировании сообщения: %s", e)
+
+
+async def _safe_answer_query(query, text: str | None = None, show_alert: bool = False) -> None:
+    """Безопасно отвечает на callback_query, игнорируя истекший таймаут и сетевые сбои."""
+    if not query:
+        return
+    try:
+        if text:
+            await query.answer(text=text, show_alert=show_alert)
+        else:
+            await query.answer()
+    except BadRequest as e:
+        if "Query is too old" in str(e):
+            log.debug("Игнорируем устаревший callback query: %s", e)
+        else:
+            log.warning("BadRequest при query.answer: %s", e)
+    except TelegramError as e:
+        log.warning("TelegramError при query.answer: %s", e)
 
 
 # ── Настройка текстов песен (Lyrics UI) ───────────────────────────────────────
@@ -2332,21 +2358,21 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
     if action == "stop_batch":
         ctx.bot_data["lyrics_batch_cancel"] = True
-        await query.answer("Останавливаю процесс…", show_alert=True)
+        await _safe_answer_query(query, "Останавливаю процесс…", show_alert=True)
         return
 
     if action == "libai":
         subaction = parts[2]
         if subaction == "stop":
             ctx.bot_data["lyrics_libai_cancel"] = True
-            await query.answer("Останавливаю выравнивание библиотеки…", show_alert=True)
+            await _safe_answer_query(query, "Останавливаю выравнивание библиотеки…", show_alert=True)
             return
 
         if ctx.bot_data.get("lyrics_libai_running"):
-            await query.answer("Операция уже выполняется!", show_alert=True)
+            await _safe_answer_query(query, "Операция уже выполняется!", show_alert=True)
             return
 
-        await query.answer()
+        await _safe_answer_query(query)
 
         loop = asyncio.get_running_loop()
         audit_data = await loop.run_in_executor(None, lambda: audit_library_lyrics(LIBRARY))
@@ -2354,7 +2380,7 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
         if not target_tracks:
             txt = "ℹ️ Нет треков с обычным текстом для выравнивания." if subaction == "plain" else "ℹ️ Нет треков без текста."
-            await query.answer(txt, show_alert=True)
+            await _safe_answer_query(query, txt, show_alert=True)
             return
 
         ctx.bot_data["lyrics_libai_running"] = True
@@ -2704,6 +2730,18 @@ async def on_owner_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
 
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальный обработчик ошибок Telegram."""
+    err = context.error
+    if isinstance(err, BadRequest) and "Query is too old" in str(err):
+        log.debug("Игнорируем устаревший callback query: %s", err)
+        return
+    if isinstance(err, (NetworkError, TimedOut)):
+        log.warning("Временный сетевой сбой Telegram API (%s): %s", type(err).__name__, err)
+        return
+    log.error("Необработанная ошибка Telegram: %s", err, exc_info=err)
+
+
 async def post_init(app: Application) -> None:
     """Запускает Inbox Watcher после инициализации бота."""
     async def on_release(folder: Path) -> None:
@@ -2752,6 +2790,8 @@ def main() -> None:
 
     # Сообщения владельца (текст или документы .lrc для ручного ввода текста песни или имени артиста)
     app.add_handler(MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, on_owner_message))
+
+    app.add_error_handler(global_error_handler)
 
     app.post_init = post_init
 

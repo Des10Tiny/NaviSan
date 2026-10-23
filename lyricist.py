@@ -53,9 +53,33 @@ def preview_lyrics(text: str, max_lines: int = 6) -> str:
 
 # Паттерн для китайских метаданных из KuGou/NetEase (作词, 作曲, 编曲 и т.д.)
 CJK_META_RE = re.compile(
-    r"^(?:\[\d{2}:\d{2}\.\d+\]\s*)?(?:作词|作曲|编曲|制作人|词|曲|录音|混音|母带|监制)\s*[:：]",
+    r"^(?:\[\d{2}:\d{2}(?:\.\d+)?\]\s*)?(?:(?:作\s*词|作\s*曲|编\s*曲|制\s*作\s*人|录\s*音|混\s*音|母\s*带|监\s*制|和\s*音|企\s*划|出\s*品|发\s*行|词|曲|原\s*唱|翻\s*唱|演\s*唱)\s*[:：\s/\-]|(?:未经.*?许可|不得.*?使用|网易云音乐|QQ音乐|酷狗音乐))",
     re.I,
 )
+
+
+def clean_track_title(t: str) -> str:
+    """Удаляет номера треков, префиксы, feat/ft/with/remastered/explicit/etc."""
+    t = re.sub(r"^\d+[\s\.\-_]+", "", t or "")
+    t = re.sub(
+        r"(?i)\s*[\(\[](?:feat\.?|ft\.?|with|prod\.?|official\s+video|explicit|remastered|bonus\s+track).*?[\)\]]",
+        "",
+        t,
+    )
+    if " - " in t:
+        t = t.split(" - ")[-1]
+    return t.strip()
+
+
+def is_translation(title: str, artist: str) -> bool:
+    """Проверяет, является ли кандидат переводом или кавером на другой язык."""
+    bad = (
+        "translation", "traducción", "traduccion", "tradução", "traducao",
+        "çeviri", "ceviri", "romanized", "übersetzung", "traduzione",
+        "paroles", "deutsche"
+    )
+    combined = f"{title} {artist}".lower()
+    return any(b in combined for b in bad)
 
 
 def clean_lrc_metadata(text: str) -> str:
@@ -76,11 +100,11 @@ def clean_lrc_metadata(text: str) -> str:
 class LyricManager:
     """Поиск, загрузка и форматирование текстов песен."""
 
-    LRCLIB_UA = "NaviSan/1.0 (https://github.com/arsen/navisan)"
     BROWSER_UA = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
+    LRCLIB_UA = BROWSER_UA
 
     # ── 1. LRCLIB ─────────────────────────────────────────────────────────────
 
@@ -96,48 +120,62 @@ class LyricManager:
         Returns:
             Кортеж (synced_result, plain_result).
         """
-        headers = {"User-Agent": self.LRCLIB_UA}
+        headers = {"User-Agent": self.BROWSER_UA}
 
-        # Шаг 1: Точный поиск по метаданным
-        exact_params = {
-            "artist_name": artist,
-            "track_name": title,
-            "album_name": album,
-            "duration": duration,
-        }
-        try:
-            r = requests.get(
-                "https://lrclib.net/api/get",
-                params=exact_params,
-                headers=headers,
-                timeout=8,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                synced = data.get("syncedLyrics")
-                plain = data.get("plainLyrics")
-                res_synced = (
-                    LyricResult(text=synced, is_synced=True, source="lrclib", track_title=title, artist=artist)
-                    if synced
-                    else None
+        clean_t = clean_track_title(title)
+        artist_tokens = [a.strip() for a in re.split(r"[,;&]|\s+(?:feat\.?|ft\.?|x|and)\s+", artist, flags=re.I) if a.strip()]
+        first_art = artist_tokens[0] if artist_tokens else artist
+
+        # Шаг 1: Точный поиск по метаданным (пробуем полный артист и первого артиста)
+        exact_trials = [
+            {"artist_name": artist, "track_name": title, "album_name": album, "duration": duration},
+            {"artist_name": first_art, "track_name": clean_t, "album_name": album},
+        ]
+        if clean_t != title:
+            exact_trials.insert(1, {"artist_name": artist, "track_name": clean_t, "album_name": album})
+
+        for exact_params in exact_trials:
+            params = {k: v for k, v in exact_params.items() if v}
+            try:
+                r = requests.get(
+                    "https://lrclib.net/api/get",
+                    params=params,
+                    headers=headers,
+                    timeout=6,
                 )
-                res_plain = (
-                    LyricResult(text=plain, is_synced=False, source="lrclib", track_title=title, artist=artist)
-                    if plain
-                    else None
-                )
-                if res_synced or res_plain:
-                    return res_synced, res_plain
-        except Exception as e:
-            log.debug("LRCLIB exact match error: %s", e)
+                if r.status_code == 200:
+                    data = r.json()
+                    synced = clean_lrc_metadata(data.get("syncedLyrics"))
+                    plain = clean_lrc_metadata(data.get("plainLyrics"))
+                    res_synced = (
+                        LyricResult(text=synced, is_synced=True, source="lrclib", track_title=title, artist=artist)
+                        if synced
+                        else None
+                    )
+                    res_plain = (
+                        LyricResult(text=plain, is_synced=False, source="lrclib", track_title=title, artist=artist)
+                        if plain
+                        else None
+                    )
+                    if res_synced or res_plain:
+                        return res_synced, res_plain
+            except Exception as e:
+                log.debug("LRCLIB exact match error: %s", e)
 
         # Шаг 2: Мягкий поиск по ключевым словам
-        artist_tokens = [a.strip() for a in re.split(r"[,;&]|\s+(?:feat\.?|ft\.?|x|and)\s+", artist, flags=re.I) if a.strip()]
-        expanded_queries = [f"{artist} {title}"]
+        expanded_queries = []
+        if first_art:
+            expanded_queries.append(f"{first_art} {clean_t}")
+        if len(artist_tokens) >= 2:
+            expanded_queries.append(f"{artist_tokens[0]} {artist_tokens[1]} {clean_t}")
+        if f"{artist} {clean_t}" not in expanded_queries:
+            expanded_queries.append(f"{artist} {clean_t}")
+        if clean_t != title and f"{first_art} {title}" not in expanded_queries:
+            expanded_queries.append(f"{first_art} {title}")
         for tok in artist_tokens:
             spaced = re.sub(r"\.([A-Za-zА-Яа-я])", r". \1", tok)
             for t_var in (tok, spaced):
-                q_var = f"{t_var} {title}"
+                q_var = f"{t_var} {clean_t}"
                 if q_var not in expanded_queries:
                     expanded_queries.append(q_var)
 
@@ -153,14 +191,23 @@ class LyricManager:
                     data = r.json()
                     if isinstance(data, list):
                         best_plain = None
+                        target_clean = clean_track_title(title).lower()
                         for item in data:
-                            api_artist = item.get("artistName", "").lower()
-                            api_title = item.get("trackName", "").lower()
-                            if title.lower() not in api_title:
+                            api_title = item.get("trackName", "")
+                            api_title_clean = clean_track_title(api_title).lower()
+
+                            # Сверка названий трека
+                            matched_title = (
+                                target_clean == api_title_clean
+                                or (target_clean in api_title_clean if len(target_clean) >= 4 else False)
+                                or (api_title_clean in target_clean if len(api_title_clean) >= 4 else False)
+                                or SequenceMatcher(None, target_clean, api_title_clean).ratio() >= 0.85
+                            )
+                            if not matched_title:
                                 continue
 
-                            synced = item.get("syncedLyrics")
-                            plain = item.get("plainLyrics")
+                            synced = clean_lrc_metadata(item.get("syncedLyrics"))
+                            plain = clean_lrc_metadata(item.get("plainLyrics"))
                             if synced:
                                 return (
                                     LyricResult(text=synced, is_synced=True, source="lrclib", track_title=title, artist=artist),
@@ -184,6 +231,7 @@ class LyricManager:
         def norm(s: str) -> str:
             return re.sub(r"[^\w]", "", (s or "").lower())
 
+        clean_t = clean_track_title(title)
         artist_tokens = [a.strip() for a in re.split(r"[,;&]|\s+(?:feat\.?|ft\.?|x|and)\s+", artist, flags=re.I) if a.strip()]
         expanded_tokens = []
         for a in artist_tokens:
@@ -193,15 +241,20 @@ class LyricManager:
             if spaced != a and spaced not in expanded_tokens:
                 expanded_tokens.append(spaced)
 
-        queries = [f"{artist} {title}"]
+        queries: list[str] = []
+        if expanded_tokens:
+            queries.append(f"{expanded_tokens[0]} {clean_t}")
+            if len(expanded_tokens) >= 2:
+                queries.append(f"{expanded_tokens[0]} {expanded_tokens[1]} {clean_t}")
+        queries.append(f"{artist} {clean_t}")
+        if clean_t != title and expanded_tokens:
+            queries.append(f"{expanded_tokens[0]} {title}")
         for tok in expanded_tokens:
-            q_tok = f"{tok} {title}"
+            q_tok = f"{tok} {clean_t}"
             if q_tok not in queries:
                 queries.append(q_tok)
-        if len(expanded_tokens) >= 2:
-            queries.insert(1, f"{expanded_tokens[0]} {expanded_tokens[1]} {title}")
 
-        target_title_norm = norm(title)
+        target_title_norm = norm(clean_t)
         clean_target_arts = [norm(a) for a in expanded_tokens if len(norm(a)) > 1]
 
         all_hits: list[dict] = []
@@ -217,7 +270,7 @@ class LyricManager:
                 )
                 if r.status_code == 200:
                     sections = r.json().get("response", {}).get("sections", [])
-                    found_song_in_q = False
+                    found_exact_song = False
                     for s in sections:
                         for h in s.get("hits", []):
                             if h.get("type") == "song" or s.get("type") == "song":
@@ -225,9 +278,13 @@ class LyricManager:
                                 url = res.get("url")
                                 if url and url not in seen_urls:
                                     seen_urls.add(url)
-                                    all_hits.append(res)
-                                    found_song_in_q = True
-                    if found_song_in_q and len(all_hits) >= 2:
+                                    h_title = res.get("title", "")
+                                    h_art = res.get("artist_names", "") + " " + res.get("primary_artist", {}).get("name", "")
+                                    if not is_translation(h_title, h_art):
+                                        all_hits.append(res)
+                                        if norm(clean_track_title(h_title)) == target_title_norm:
+                                            found_exact_song = True
+                    if found_exact_song and len(all_hits) >= 2:
                         break
             except Exception as e:
                 log.debug("Genius search query '%s' error: %s", q, e)
@@ -243,12 +300,13 @@ class LyricManager:
             hit_title = res.get("title", "")
             art_names = (res.get("artist_names", "") + " " + res.get("primary_artist", {}).get("name", "")).lower()
 
-            if "translation" in hit_title.lower() or "translation" in art_names:
+            if is_translation(hit_title, art_names):
                 continue
             if "remix" in hit_title.lower() and "remix" not in title.lower():
                 continue
 
-            hit_title_norm = norm(hit_title)
+            hit_title_clean = clean_track_title(hit_title)
+            hit_title_norm = norm(hit_title_clean)
             if not hit_title_norm:
                 continue
 
@@ -256,7 +314,7 @@ class LyricManager:
             # 1. Совпадение названия
             if hit_title_norm == target_title_norm:
                 score += 60
-                if hit_title.strip().lower() == title.strip().lower():
+                if hit_title_clean.strip().lower() == clean_t.strip().lower():
                     score += 20
             else:
                 sim = SequenceMatcher(None, target_title_norm, hit_title_norm).ratio()
@@ -306,9 +364,11 @@ class LyricManager:
             full_text = re.sub(r"\n{3,}", "\n\n", full_text)
             full_text = re.sub(r"\d*Embed$", "", full_text.strip())
 
-            if full_text.strip():
+            full_text = clean_lrc_metadata(full_text.strip())
+
+            if full_text:
                 return LyricResult(
-                    text=full_text.strip(),
+                    text=full_text,
                     is_synced=False,
                     source="genius",
                     track_title=title,
