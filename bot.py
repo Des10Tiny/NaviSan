@@ -423,6 +423,7 @@ async def on_cover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
                 text=final_text,
                 parse_mode="Markdown",
             )
+            delete_later(ctx.bot, OWNER_ID, status_msg.message_id, delay=5.0)
             return
 
         # Обычный режим (Inbox -> Staging -> Library):
@@ -959,7 +960,12 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 
     if action == "stop":
         ctx.bot_data["upgrade_cancelled"] = True
-        await query.answer("Останавливаю процесс…", show_alert=True)
+        await _safe_edit_message(
+            query,
+            "⏹️ *Останавливаю процесс...*\n\n_Пожалуйста, подожди завершения текущей операции..._",
+            reply_markup=None,
+        )
+        await query.answer("Останавливаю процесс…")
         return
 
     if action == "start":
@@ -979,6 +985,8 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         mode_badge = "⚡ FORCE" if is_force else "▶️ ОБЫЧНЫЙ"
 
         def _on_progress(cur: int, tot: int, alb_name: str, res: dict):
+            if ctx.bot_data.get("upgrade_cancelled"):
+                return
             nonlocal last_edit_time
             now = time.time()
             # Промежуточный прогресс отправляем только для cur < tot, чтобы не конфликтовать с финальным сообщением
@@ -2222,6 +2230,8 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         last_edit_time = 0.0
 
         def _on_albai_progress(cur: int, tot: int, tr_name: str):
+            if ctx.bot_data.get("lyrics_batch_cancel"):
+                return
             nonlocal last_edit_time
             now = time.time()
             if now - last_edit_time > 1.8 or cur == tot:
@@ -2295,6 +2305,8 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         last_edit_time = 0.0
 
         def _on_albmiss_progress(cur: int, tot: int, tr_name: str):
+            if ctx.bot_data.get("lyrics_batch_cancel"):
+                return
             nonlocal last_edit_time
             now = time.time()
             if now - last_edit_time > 1.8 or cur == tot:
@@ -2358,14 +2370,24 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 
     if action == "stop_batch":
         ctx.bot_data["lyrics_batch_cancel"] = True
-        await _safe_answer_query(query, "Останавливаю процесс…", show_alert=True)
+        await _safe_edit_message(
+            query,
+            "⏹️ *Останавливаю процесс...*\n\n_Пожалуйста, подожди завершения текущего трека..._",
+            reply_markup=None,
+        )
+        await _safe_answer_query(query, "Останавливаю процесс…")
         return
 
     if action == "libai":
         subaction = parts[2]
         if subaction == "stop":
             ctx.bot_data["lyrics_libai_cancel"] = True
-            await _safe_answer_query(query, "Останавливаю выравнивание библиотеки…", show_alert=True)
+            await _safe_edit_message(
+                query,
+                "⏹️ *Останавливаю выравнивание библиотеки...*\n\n_Пожалуйста, подожди завершения текущего трека..._",
+                reply_markup=None,
+            )
+            await _safe_answer_query(query, "Останавливаю выравнивание библиотеки…")
             return
 
         if ctx.bot_data.get("lyrics_libai_running"):
@@ -2388,6 +2410,8 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         last_edit_time = 0.0
 
         def _on_libai_progress(cur: int, tot: int, artist_title: str, alb: str, success: int, fail: int):
+            if ctx.bot_data.get("lyrics_libai_cancel"):
+                return
             nonlocal last_edit_time
             now = time.time()
             if now - last_edit_time > 2.0 or cur == tot:
@@ -2443,12 +2467,16 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                     else:  # missing
                         dur = int(audio.info.length) if hasattr(audio.info, "length") else 0
                         res = lm.find_lyrics(artist, title, alb, dur)
+                        if ctx.bot_data.get("lyrics_libai_cancel"):
+                            break
                         if res and res.text:
                             if res.is_synced:
                                 tr.with_suffix(".lrc").write_text(res.text, encoding="utf-8")
                                 success += 1
                             else:
                                 tr.with_suffix(".lrc").write_text(res.text, encoding="utf-8")
+                                if ctx.bot_data.get("lyrics_libai_cancel"):
+                                    break
                                 ai_res, _ = lm.ai_align_track(tr, model=model)
                                 if ai_res and ai_res.is_synced:
                                     success += 1
@@ -2469,12 +2497,15 @@ async def on_lyrics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         finally:
             ctx.bot_data["lyrics_libai_running"] = False
 
-        # Обновляем аудит
-        audit_data = await loop.run_in_executor(None, lambda: audit_library_lyrics(LIBRARY))
-        ctx.bot_data["lyrics_audit_data"] = audit_data
-
         was_cancelled = ctx.bot_data.pop("lyrics_libai_cancel", False)
         status_word = "остановлено" if was_cancelled else "завершено"
+
+        if not was_cancelled:
+            # Обновляем аудит только при штатном завершении, чтобы не блокировать UI тяжелым сканированием диска
+            audit_data = await loop.run_in_executor(None, lambda: audit_library_lyrics(LIBRARY))
+            ctx.bot_data["lyrics_audit_data"] = audit_data
+        else:
+            ctx.bot_data.pop("lyrics_audit_data", None)
 
         res_text = (
             f"✅ *AI-выравнивание библиотеки {status_word}!*\n\n"

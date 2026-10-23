@@ -255,6 +255,8 @@ class LyricManager:
                 queries.append(q_tok)
 
         target_title_norm = norm(clean_t)
+        target_base = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", clean_t).strip()
+        target_base_norm = norm(target_base)
         clean_target_arts = [norm(a) for a in expanded_tokens if len(norm(a)) > 1]
 
         all_hits: list[dict] = []
@@ -282,7 +284,14 @@ class LyricManager:
                                     h_art = res.get("artist_names", "") + " " + res.get("primary_artist", {}).get("name", "")
                                     if not is_translation(h_title, h_art):
                                         all_hits.append(res)
-                                        if norm(clean_track_title(h_title)) == target_title_norm:
+                                        h_clean = clean_track_title(h_title)
+                                        h_base = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", h_clean).strip()
+                                        if (
+                                            norm(h_clean) == target_title_norm
+                                            or (h_base and norm(h_base) == target_title_norm)
+                                            or (target_base_norm and norm(h_clean) == target_base_norm)
+                                            or (h_base and target_base_norm and norm(h_base) == target_base_norm)
+                                        ):
                                             found_exact_song = True
                     if found_exact_song and len(all_hits) >= 2:
                         break
@@ -310,14 +319,28 @@ class LyricManager:
             if not hit_title_norm:
                 continue
 
+            hit_base = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", hit_title_clean).strip()
+            hit_base_norm = norm(hit_base)
+            hit_parens = [norm(p) for p in re.findall(r"[\(\[](.*?)[\)\]]", hit_title_clean)]
+
             score = 0
             # 1. Совпадение названия
             if hit_title_norm == target_title_norm:
                 score += 60
                 if hit_title_clean.strip().lower() == clean_t.strip().lower():
                     score += 20
+            elif hit_base_norm == target_title_norm or (target_base_norm and hit_base_norm == target_base_norm):
+                score += 55
+            elif target_base_norm and hit_title_norm == target_base_norm:
+                score += 55
+            elif target_title_norm in hit_parens or (target_base_norm and target_base_norm in hit_parens):
+                score += 50
             else:
-                sim = SequenceMatcher(None, target_title_norm, hit_title_norm).ratio()
+                sim = max(
+                    SequenceMatcher(None, target_title_norm, hit_title_norm).ratio(),
+                    SequenceMatcher(None, target_title_norm, hit_base_norm).ratio() if hit_base_norm else 0,
+                    SequenceMatcher(None, target_base_norm, hit_base_norm).ratio() if (target_base_norm and hit_base_norm) else 0,
+                )
                 if sim >= 0.8:
                     score += int(sim * 50)
                 else:
