@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -19,15 +20,26 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+try:
+    import urllib3.util.connection as urllib_conn
+    urllib_conn.HAS_IPV6 = False
+except Exception:
+    pass
 
 log = logging.getLogger(__name__)
 
 # ── Константы ────────────────────────────────────────────────────────────────
 
 API_URL = "https://covers.musichoarders.xyz/api/search"
+YANDEX_API_URL = "https://api.music.yandex.net/search"
 
 # Apple Music исключён: CDN отдаёт WebP под расширением .jpg (ADR-0012).
-DEFAULT_SOURCES: tuple[str, ...] = ("amazonmusic", "deezer", "spotify", "tidal")
+# yandex опрашивается напрямую через API Яндекс Музыки.
+DEFAULT_SOURCES: tuple[str, ...] = ("yandex", "spotify", "deezer", "tidal", "amazonmusic")
 DEFAULT_COUNTRY = "us"
 
 _BROWSER_UA = (
@@ -148,16 +160,148 @@ def is_valid_cover_candidate(
     return score_cover_candidate(candidate, target_artist, target_album) >= min_score
 
 
-# ── Поиск ────────────────────────────────────────────────────────────────────
+# ── Поиск Яндекс Музыки ──────────────────────────────────────────────────────
+
+def _build_yandex_cover_url(cover_uri: str, size: str) -> str:
+    """Формирует URL обложки Яндекс Музыки заданного размера (напр. 'm1000x1000' или '400x400')."""
+    if "%%" in cover_uri:
+        url = cover_uri.replace("%%", size)
+    else:
+        url = f"{cover_uri.rstrip('/')}/{size}"
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = f"https://{url}"
+    return url
+
+
+def _search_yandex_covers(
+    artist: str,
+    album: str,
+    *,
+    token: str | None = None,
+) -> list[CoverCandidate]:
+    """Ищет обложки релизов напрямую через API Яндекс Музыки.
+
+    Если сервер находится за пределами РФ/СНГ, для обхода ошибки 451
+    используется OAuth-токен (параметр YANDEX_MUSIC_TOKEN в .env).
+    """
+    if not artist or not album:
+        return []
+
+    if token is None:
+        token = os.getenv("YANDEX_MUSIC_TOKEN", "").strip()
+
+    headers = {
+        "User-Agent": _BROWSER_UA,
+        "Accept": "application/json",
+    }
+    if token:
+        headers["Authorization"] = f"OAuth {token}"
+
+    query = f"{artist} {album}".strip()
+    params = {
+        "text": query,
+        "type": "album",
+        "page": 0,
+    }
+
+    log.info("Запрос Yandex Music API: '%s'", query)
+
+    try:
+        resp = requests.get(
+            YANDEX_API_URL,
+            headers=headers,
+            params=params,
+            timeout=(_CONNECT_TIMEOUT, _STREAM_TIMEOUT),
+        )
+        if resp.status_code == 451:
+            log.debug(
+                "Yandex Music API вернул 451 (геоблокировка). "
+                "Для работы из-за рубежа укажите YANDEX_MUSIC_TOKEN в .env"
+            )
+            return []
+        if resp.status_code == 401:
+            log.warning("Yandex Music API: 401 Unauthorized (проверьте YANDEX_MUSIC_TOKEN в .env)")
+            return []
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as exc:
+        log.debug("Ошибка запроса к Yandex Music API: %s", exc)
+        return []
+
+    result = data.get("result", {})
+    albums_data = result.get("albums", {})
+    albums = albums_data.get("results") or albums_data.get("items") or []
+    if not albums:
+        return []
+
+    candidates: list[CoverCandidate] = []
+    seen_uris: set[str] = set()
+
+    for alb in albums:
+        cover_uri = alb.get("coverUri")
+        if not cover_uri or cover_uri in seen_uris:
+            continue
+        seen_uris.add(cover_uri)
+
+        big_url = _build_yandex_cover_url(cover_uri, "m1000x1000")
+        small_url = _build_yandex_cover_url(cover_uri, "400x400")
+
+        alb_artists: list[str] = []
+        for a in alb.get("artists", []):
+            if isinstance(a, dict):
+                name = a.get("name", "").strip()
+                if name:
+                    alb_artists.append(name)
+            elif isinstance(a, str) and a.strip():
+                alb_artists.append(a.strip())
+
+        cand_artist = ", ".join(alb_artists) if alb_artists else artist
+        cand_title = (alb.get("title") or "").strip()
+        version = (alb.get("version") or "").strip()
+        if version and version.lower() not in cand_title.lower():
+            cand_title = f"{cand_title} ({version})"
+
+        rel_date = alb.get("releaseDate")
+        year = alb.get("year")
+        cand_date: str | None = None
+        if rel_date and len(str(rel_date)) >= 10:
+            cand_date = str(rel_date)[:10]
+        elif year:
+            cand_date = str(year)
+
+        alb_id = alb.get("id")
+        release_url = f"https://music.yandex.ru/album/{alb_id}" if alb_id else None
+
+        candidate = CoverCandidate(
+            small_url=small_url,
+            big_url=big_url,
+            source="yandex",
+            title=cand_title,
+            artist=cand_artist,
+            date=cand_date,
+            tracks=alb.get("trackCount"),
+            release_url=release_url,
+        )
+        candidates.append(candidate)
+        log.debug("  ← yandex: %s — %s (%s)", candidate.artist, candidate.title, candidate.date or "—")
+
+    return candidates
+
+
+# ── Поиск MusicHoarders ──────────────────────────────────────────────────────
 
 def _raw_search_covers(
     artist: str,
     album: str,
     *,
     country: str = DEFAULT_COUNTRY,
-    sources: tuple[str, ...] = DEFAULT_SOURCES,
+    sources: tuple[str, ...] = ("amazonmusic", "deezer", "spotify", "tidal"),
 ) -> list[CoverCandidate]:
     """Выполняет один одиночный HTTP POST запрос к covers.musichoarders.xyz."""
+    mh_sources = [s for s in sources if s != "yandex"]
+    if not mh_sources:
+        return []
+
     session_id = uuid.uuid4().hex
 
     headers = {
@@ -172,10 +316,10 @@ def _raw_search_covers(
         "artist": artist,
         "album": album,
         "country": country,
-        "sources": list(sources),
+        "sources": mh_sources,
     }
 
-    log.info("Запрос covers API: '%s' — '%s' (источники: %s)", artist, album, ", ".join(sources))
+    log.info("Запрос covers API: '%s' — '%s' (источники: %s)", artist, album, ", ".join(mh_sources))
 
     try:
         resp = requests.post(
@@ -192,7 +336,7 @@ def _raw_search_covers(
 
     candidates: list[CoverCandidate] = []
     seen_urls: set[str] = set()
-    sources_pending = set(sources)
+    sources_pending = set(mh_sources)
 
     try:
         for raw_line in resp.iter_lines(decode_unicode=True):
@@ -286,23 +430,39 @@ def search_covers(
     all_candidates: list[CoverCandidate] = []
     seen_urls: set[str] = set()
 
-    for q_idx, q_artist in enumerate(queries):
-        raw_cands = _raw_search_covers(q_artist, album, country=country, sources=sources)
-        new_high_matches = 0
-        for c in raw_cands:
+    # 1. Поиск через API Яндекс Музыки
+    if "yandex" in sources:
+        yandex_cands = _search_yandex_covers(artist, album)
+        if not yandex_cands and len(tokens) >= 2:
+            yandex_cands = _search_yandex_covers(tokens[0], album)
+        for c in yandex_cands:
             if not c.big_url or c.big_url in seen_urls:
                 continue
             seen_urls.add(c.big_url)
             score = score_cover_candidate(c, artist, album)
             if score > 0.4:
                 all_candidates.append(c)
-                if score >= 0.7:
-                    new_high_matches += 1
 
-        # Если уже на первом или текущем запросе нашли как минимум 2 отличных совпадения
-        # (или 1 с высоким баллом для соло-артиста), дальнейшие запросы не нужны
-        if new_high_matches >= 2 or (q_idx == 0 and new_high_matches >= 1 and len(tokens) <= 1):
-            break
+    # 2. Поиск через MusicHoarders (Deezer, Spotify, Tidal, Amazon)
+    mh_sources = tuple(s for s in sources if s != "yandex")
+    if mh_sources:
+        for q_idx, q_artist in enumerate(queries):
+            raw_cands = _raw_search_covers(q_artist, album, country=country, sources=mh_sources)
+            new_high_matches = 0
+            for c in raw_cands:
+                if not c.big_url or c.big_url in seen_urls:
+                    continue
+                seen_urls.add(c.big_url)
+                score = score_cover_candidate(c, artist, album)
+                if score > 0.4:
+                    all_candidates.append(c)
+                    if score >= 0.7:
+                        new_high_matches += 1
+
+            # Если уже на первом или текущем запросе нашли как минимум 2 отличных совпадения
+            # (или 1 с высоким баллом для соло-артиста), дальнейшие запросы не нужны
+            if new_high_matches >= 2 or (q_idx == 0 and new_high_matches >= 1 and len(tokens) <= 1):
+                break
 
     if not all_candidates:
         log.warning("Поиск обложек: для '%s — %s' не найдено релевантных обложек", artist, album)
