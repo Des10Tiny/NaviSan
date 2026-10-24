@@ -1049,6 +1049,7 @@ def upgrade_album(
     force_lyrics: bool = False,
     force_replaygain: bool = False,
     force: bool = False,
+    cancel_flag: Callable[[], bool] | None = None,
 ) -> dict:
     """Выполняет полную стандартизацию («идеализацию») альбома на месте.
 
@@ -1058,6 +1059,9 @@ def upgrade_album(
     4. Приводит имя папки релиза к 'Artist - Album'.
     5. Рассчитывает ReplayGain (потрековый и альбомный).
     """
+    if cancel_flag and cancel_flag():
+        return {"cancelled": True, "old_folder": album_dir.name, "new_folder": album_dir.name, "folder_path": album_dir}
+
     if force:
         force_cover = True
         force_lyrics = True
@@ -1077,6 +1081,8 @@ def upgrade_album(
 
     # Шаг 1: Первым делом чистим и нормализуем метаданные во всех треках
     for flac in flac_files:
+        if cancel_flag and cancel_flag():
+            return {"cancelled": True, "old_folder": album_dir.name, "new_folder": album_dir.name, "folder_path": album_dir}
         try:
             surgeon.heal_file(str(flac))
         except Exception as e:
@@ -1086,6 +1092,8 @@ def upgrade_album(
     # которые присутствуют во всех 100% треков релиза, сортируем их по алфавиту
     # и обновляем ALBUMARTIST в тегах всех файлов.
     if force:
+        if cancel_flag and cancel_flag():
+            return {"cancelled": True, "old_folder": album_dir.name, "new_folder": album_dir.name, "folder_path": album_dir}
         track_artists_sets = []
         for f in flac_files:
             try:
@@ -1113,9 +1121,13 @@ def upgrade_album(
                         log.warning("Не удалось обновить ALBUMARTIST в %s: %s", f.name, e)
 
     # Шаг 1.6: Онлайн-проверка Explicit-статуса и лейбла через Deezer/iTunes
+    if cancel_flag and cancel_flag():
+        return {"cancelled": True, "old_folder": album_dir.name, "new_folder": album_dir.name, "folder_path": album_dir}
     explicit_added, label_added = enrich_album_online_metadata(album_dir, force=force)
 
     # Шаг 2: Теперь берём гарантированно чистые artist и album для поиска обложки
+    if cancel_flag and cancel_flag():
+        return {"cancelled": True, "old_folder": album_dir.name, "new_folder": album_dir.name, "folder_path": album_dir}
     artist, album = album_info(album_dir)
     if force_cover or not album_has_cover(album_dir):
         if artist and album:
@@ -1137,6 +1149,8 @@ def upgrade_album(
     # Шаг 3: Переименование треков и подгрузка текстов песен (.lrc)
     flac_files = sorted(album_dir.rglob("*.flac"))
     for flac in flac_files:
+        if cancel_flag and cancel_flag():
+            return {"cancelled": True, "old_folder": album_dir.name, "new_folder": album_dir.name, "folder_path": album_dir}
         try:
             new_flac = renamer.rename_file(str(flac))
             res_status = lyricist.process_file(new_flac, overwrite=force_lyrics, smart_upgrade=True)
@@ -1147,10 +1161,14 @@ def upgrade_album(
             log.warning("Ошибка обработки трека %s: %s", flac.name, e)
 
     # Шаг 4: Приведение имени папки к каноническому 'Artist - Album'
+    if cancel_flag and cancel_flag():
+        return {"cancelled": True, "old_folder": album_dir.name, "new_folder": album_dir.name, "folder_path": album_dir}
     new_folder_str = renamer.rename_album_folder(str(album_dir), force_common_artists=force)
     new_folder = Path(new_folder_str)
 
     # Шаг 5: Проверка и расчёт ReplayGain
+    if cancel_flag and cancel_flag():
+        return {"cancelled": True, "old_folder": album_dir.name, "new_folder": new_folder.name, "folder_path": new_folder}
     from replaygain import album_has_replaygain, apply_replaygain
     replaygain_added = False
     if force_replaygain or not album_has_replaygain(new_folder):
@@ -1201,7 +1219,11 @@ def upgrade_library(
             log.info("Идеализация библиотеки прервана пользователем")
             break
 
-        res = upgrade_album(album_folder, db_path=db_path, force=force)
+        res = upgrade_album(album_folder, db_path=db_path, force=force, cancel_flag=cancel_flag)
+        if res.get("cancelled") or (cancel_flag and cancel_flag()):
+            log.info("Идеализация библиотеки прервана пользователем")
+            break
+
         processed += 1
         if res.get("cover_added"):
             total_covers += 1

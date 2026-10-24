@@ -960,12 +960,13 @@ async def on_upgrade_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 
     if action == "stop":
         ctx.bot_data["upgrade_cancelled"] = True
+        log.info("Остановка идеализации библиотеки запрошена пользователем (upgrade:stop)")
         await _safe_edit_message(
             query,
             "⏹️ *Останавливаю процесс...*\n\n_Пожалуйста, подожди завершения текущей операции..._",
             reply_markup=None,
         )
-        await query.answer("Останавливаю процесс…")
+        await _safe_answer_query(query, "Останавливаю процесс…")
         return
 
     if action == "start":
