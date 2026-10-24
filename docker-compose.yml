@@ -18,5 +18,3 @@ services:
       - ./library:/library:rw
       # База данных Navidrome (read-only) для сверки канонических имён артистов
       - ./navidrome.db:/data/navidrome.db:ro
-      # Локальный кеш сопоставления артистов
-      - ./artists_cache.json:/app/artists_cache.json:rw

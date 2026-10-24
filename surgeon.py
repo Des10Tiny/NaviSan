@@ -139,11 +139,58 @@ class FLACSurgeon:
             elif val in ("0", "false", "no", "none"):
                 audio["itunesadvisory"] = ["0"]
 
-        # 0. Миграция YEAR в DATE перед whitelist-фильтрацией
+        # 0. Миграция YEAR в DATE и нормализация треков/дисков перед whitelist-фильтрацией
         raw_year_pre = audio.get("year", [""])[0].strip()
         raw_date_pre = audio.get("date", [""])[0].strip()
         if raw_year_pre and (not raw_date_pre or len(raw_year_pre) > len(raw_date_pre)):
             audio["date"] = [raw_year_pre]
+
+        # Миграция устаревших алиасов (totaltracks -> tracktotal, totaldiscs -> disctotal)
+        if "totaltracks" in audio and "tracktotal" not in audio:
+            audio["tracktotal"] = audio["totaltracks"]
+        if "totaldiscs" in audio and "disctotal" not in audio:
+            audio["disctotal"] = audio["totaldiscs"]
+        if "track" in audio and "tracknumber" not in audio:
+            audio["tracknumber"] = audio["track"]
+        if "disc" in audio and "discnumber" not in audio:
+            audio["discnumber"] = audio["disc"]
+
+        # Нормализация дробей вида <номер>/<всего> в отдельные теги (стандарт Vorbis Comment)
+        raw_tn = str(audio.get("tracknumber", [""])[0]).strip()
+        if "/" in raw_tn:
+            tn_num, _, tn_tot = raw_tn.partition("/")
+            tn_num = tn_num.strip()
+            tn_tot = tn_tot.strip()
+            if tn_num:
+                audio["tracknumber"] = [str(int(tn_num))] if tn_num.isdigit() else [tn_num]
+            if tn_tot and tn_tot.isdigit() and int(tn_tot) > 0 and not audio.get("tracktotal"):
+                audio["tracktotal"] = [str(int(tn_tot))]
+        elif raw_tn and raw_tn.isdigit():
+            audio["tracknumber"] = [str(int(raw_tn))]
+
+        raw_tt = str(audio.get("tracktotal", [""])[0]).strip()
+        if "/" in raw_tt:
+            raw_tt = raw_tt.split("/")[-1].strip()
+        if raw_tt and raw_tt.isdigit() and int(raw_tt) > 0:
+            audio["tracktotal"] = [str(int(raw_tt))]
+
+        raw_dn = str(audio.get("discnumber", [""])[0]).strip()
+        if "/" in raw_dn:
+            dn_num, _, dn_tot = raw_dn.partition("/")
+            dn_num = dn_num.strip()
+            dn_tot = dn_tot.strip()
+            if dn_num:
+                audio["discnumber"] = [str(int(dn_num))] if dn_num.isdigit() else [dn_num]
+            if dn_tot and dn_tot.isdigit() and int(dn_tot) > 0 and not audio.get("disctotal"):
+                audio["disctotal"] = [str(int(dn_tot))]
+        elif raw_dn and raw_dn.isdigit():
+            audio["discnumber"] = [str(int(raw_dn))]
+
+        raw_dt = str(audio.get("disctotal", [""])[0]).strip()
+        if "/" in raw_dt:
+            raw_dt = raw_dt.split("/")[-1].strip()
+        if raw_dt and raw_dt.isdigit() and int(raw_dt) > 0:
+            audio["disctotal"] = [str(int(raw_dt))]
 
         # 1. Фильтрация по whitelist тегов и очистка мусорных значений
         saved_tags: dict[str, list[str]] = {}
