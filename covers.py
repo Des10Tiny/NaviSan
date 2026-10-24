@@ -138,7 +138,12 @@ def score_cover_candidate(
     matched_arts = 0
     for tt in target_tokens:
         for ct in cand_tokens:
-            if tt == ct or (len(tt) > 3 and tt in ct) or (len(ct) > 3 and ct in tt):
+            if (
+                tt == ct
+                or (len(tt) > 3 and tt in ct)
+                or (len(ct) > 3 and ct in tt)
+                or (len(tt) >= 4 and len(ct) >= 4 and SequenceMatcher(None, tt, ct).ratio() >= 0.82)
+            ):
                 matched_arts += 1
                 break
 
