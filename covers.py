@@ -373,15 +373,29 @@ def _raw_search_covers(
 
             if msg_type == "cover":
                 big_url = obj.get("bigCoverUrl", "")
+                small_url = obj.get("smallCoverUrl", "") or big_url
                 if not big_url or big_url in seen_urls:
                     continue
+
+                # Исключаем видео-обложки (Tidal .mp4 и др.), так как они не являются изображениями
+                if any(ext in big_url.lower() or ext in small_url.lower() for ext in (".mp4", ".m4v", ".webm", ".mov", "/videos/")):
+                    log.debug("  Пропущена видео-обложка: %s", big_url)
+                    continue
+
                 seen_urls.add(big_url)
+                src = obj.get("source", "unknown")
+
+                # Для Spotify smallCoverUrl генерируется со вторичным хешем b273,
+                # который CDN Akamai периодически блокирует или отдаёт 404 серверам Telegram.
+                # bigCoverUrl у Spotify всегда отдаётся стабильно.
+                if src == "spotify" and "i.scdn.co/image/" in big_url:
+                    small_url = big_url
 
                 info = obj.get("releaseInfo", {})
                 candidate = CoverCandidate(
-                    small_url=obj.get("smallCoverUrl", ""),
+                    small_url=small_url,
                     big_url=big_url,
-                    source=obj.get("source", "unknown"),
+                    source=src,
                     title=info.get("title", ""),
                     artist=info.get("artist", "").strip(),
                     date=info.get("date"),

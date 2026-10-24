@@ -21,8 +21,9 @@ import os
 import time
 from enum import Enum, auto
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
+import requests
 from dotenv import load_dotenv
 from mutagen.flac import FLAC
 from telegram import (
@@ -230,8 +231,50 @@ async def _send_native_slideshow(
         },
     }
 
-    res = await app.bot._do_post("sendRichMessage", payload)
-    return res.get("message_id")
+    try:
+        res = await app.bot._do_post("sendRichMessage", payload)
+        return res.get("message_id")
+    except Exception as exc:
+        err_str = str(exc).lower()
+        if "wrong type of the web page content" in err_str or "bad request" in err_str:
+            log.warning("sendRichMessage отклонен Telegram ('%s'). Выполняем автоисправление кандидатов страницы...", exc)
+            # 1. Пробуем заменить small_url на big_url у тех кандидатов, где они различаются
+            candidates_list = list(session.candidates)
+            fixed_any = False
+            for i, c in enumerate(display):
+                if c.small_url != c.big_url:
+                    g_idx = start_idx + i
+                    candidates_list[g_idx] = replace(c, small_url=c.big_url)
+                    fixed_any = True
+
+            if fixed_any:
+                session.candidates = candidates_list
+                log.info("Повторная попытка sendRichMessage с big_url...")
+                try:
+                    return await _send_native_slideshow(app, session)
+                except Exception:
+                    pass
+
+            # 2. Если замена не помогла, исключаем сбойных кандидатов из session.candidates
+            valid_cands = []
+            for c in session.candidates:
+                if c in display:
+                    try:
+                        r = requests.get(c.small_url, timeout=2.0, headers={"User-Agent": "Mozilla/5.0"})
+                        if r.status_code == 200 and "image" in r.headers.get("content-type", "").lower():
+                            valid_cands.append(c)
+                        else:
+                            log.warning("Исключена сбойная обложка [%s]: %s (status=%d, ctype=%s)", c.source, c.small_url, r.status_code, r.headers.get("content-type", ""))
+                    except Exception as test_exc:
+                        log.warning("Исключена сбойная обложка [%s]: %s (ошибка: %s)", c.source, c.small_url, test_exc)
+                else:
+                    valid_cands.append(c)
+
+            if len(valid_cands) < len(session.candidates) and valid_cands:
+                session.candidates = valid_cands
+                log.info("Исключены сбойные кандидаты, осталось %d. Повторная отправка...", len(valid_cands))
+                return await _send_native_slideshow(app, session)
+        raise
 
 
 # ── Основной flow: обнаружение релиза ─────────────────────────────────────────
@@ -346,7 +389,26 @@ async def on_cover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
     _, action, *args = query.data.split(":")
 
-    # Удаляем сообщение со слайдшоу сразу при клике, чтобы чат оставался чистым
+    # 1. Переключение на следующую пачку обложек (Round-Robin)
+    if action == "next_page":
+        old_msg_id = query.message.message_id if query.message else session.picker_message_id
+        session.page += 1
+        try:
+            msg_id = await _send_native_slideshow(ctx.application, session)
+            session.picker_message_id = msg_id
+            # Удаляем старое сообщение со слайдшоу только ПОСЛЕ успешного показа новой страницы
+            if old_msg_id:
+                try:
+                    await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=old_msg_id)
+                except Exception:
+                    pass
+        except Exception as e:
+            session.page -= 1
+            log.error("Ошибка при показе следующей страницы обложек: %s", e)
+            await query.answer(f"⚠️ Не удалось загрузить страницу: {e}", show_alert=True)
+        return
+
+    # Для остальных действий (cancel, skip, pick) удаляем сообщение со слайдшоу сразу
     if query.message:
         try:
             await query.delete_message()
@@ -357,17 +419,6 @@ async def on_cover_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             await ctx.bot.delete_message(chat_id=OWNER_ID, message_id=session.picker_message_id)
         except Exception:
             pass
-
-    # 1. Переключение на следующую пачку обложек (Round-Robin)
-    if action == "next_page":
-        session.page += 1
-        try:
-            msg_id = await _send_native_slideshow(ctx.application, session)
-            session.picker_message_id = msg_id
-        except Exception as e:
-            log.error("Ошибка при показе следующей страницы обложек: %s", e)
-            await query.answer(f"⚠️ Ошибка: {e}", show_alert=True)
-        return
 
     # 2. Отмена
     if action == "cancel":
