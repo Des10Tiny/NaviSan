@@ -45,15 +45,40 @@ def clean_date_str(s: str) -> str:
     return s
 
 
+def parse_genres(raw_genres: str | list[str] | None) -> list[str]:
+    """Разбивает строки жанров (Hip-Hop/Rap, Pop\\Rock, Dance, House) на список уникальных жанров."""
+    if not raw_genres:
+        return []
+    if isinstance(raw_genres, str):
+        raw_list = [raw_genres]
+    else:
+        raw_list = list(raw_genres)
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_list:
+        parts = re.split(r"[/;]|\\+|\s*,\s*", str(item))
+        for part in parts:
+            clean = part.strip()
+            if not clean:
+                continue
+            if clean.lower() == "hip hop":
+                clean = "Hip-Hop"
+            if clean.lower() not in seen:
+                seen.add(clean.lower())
+                result.append(clean)
+    return result
+
+
 class FLACSurgeon:
     """Очистка метаданных и вшивание обложек в FLAC-файлы."""
 
     # Tag Whitelist по ADR-0006
     WHITELIST: frozenset[str] = frozenset({
         "title", "artist", "albumartist", "album",
-        "date", "originaldate", "tracknumber", "tracktotal",
+        "date", "tracknumber", "tracktotal",
         "discnumber", "disctotal", "genre", "label",
-        "rating", "compilation", "itunesadvisory",
+        "itunesadvisory",
         "replaygain_track_gain", "replaygain_track_peak",
         "replaygain_album_gain", "replaygain_album_peak",
         "replaygain_reference_loudness",
@@ -139,10 +164,13 @@ class FLACSurgeon:
             elif val in ("0", "false", "no", "none"):
                 audio["itunesadvisory"] = ["0"]
 
-        # 0. Миграция YEAR в DATE и нормализация треков/дисков перед whitelist-фильтрацией
+        # 0. Миграция YEAR и ORIGINALDATE в DATE перед whitelist-фильтрацией
         raw_year_pre = audio.get("year", [""])[0].strip()
         raw_date_pre = audio.get("date", [""])[0].strip()
-        if raw_year_pre and (not raw_date_pre or len(raw_year_pre) > len(raw_date_pre)):
+        raw_orig_pre = audio.get("originaldate", [""])[0].strip()
+        if raw_orig_pre and (not raw_date_pre or len(raw_orig_pre) > len(raw_date_pre)):
+            audio["date"] = [raw_orig_pre]
+        elif raw_year_pre and (not raw_date_pre or len(raw_year_pre) > len(raw_date_pre)):
             audio["date"] = [raw_year_pre]
 
         # Миграция устаревших алиасов (totaltracks -> tracktotal, totaldiscs -> disctotal)
@@ -248,6 +276,14 @@ class FLACSurgeon:
             raw = " & ".join(audio["albumartist"])
             audio["albumartist"] = self.sanitizer.process_artists(raw)
 
+        # 3.5. Разбивка мульти-жанров (Hip-Hop/Rap -> ['Hip-Hop', 'Rap'])
+        if "genre" in audio:
+            parsed_genres = parse_genres(audio["genre"])
+            if parsed_genres:
+                audio["genre"] = parsed_genres
+            else:
+                del audio["genre"]
+
         # 4. Вшивание обложки из cover.jpg
         self._embed_cover_from_file(audio, path.parent, force_update)
 
@@ -260,45 +296,22 @@ class FLACSurgeon:
         clean_year = clean_date_str(raw_year)
         clean_orig = clean_date_str(raw_orig)
 
-        if clean_orig and clean_orig != raw_orig:
-            audio["originaldate"] = [clean_orig]
-
-        # Выбираем наиболее полную дату
+        # Выбираем наиболее полную дату (YYYY-MM-DD имеет приоритет над YYYY)
         best_full_date = ""
-        if len(clean_year) > len(clean_date):
-            best_full_date = clean_year
-        elif clean_date:
-            best_full_date = clean_date
-        elif clean_orig:
-            best_full_date = clean_orig
+        for cand in (clean_orig, clean_year, clean_date):
+            if len(cand) > len(best_full_date):
+                best_full_date = cand
+        if not best_full_date:
+            best_full_date = clean_date or clean_orig or clean_year
 
-        # Извлекаем 4-значный год для стандартного тега DATE (стандарт Vorbis Comment)
-        year_4_digits = ""
-        for cand in (best_full_date, clean_year, clean_date, clean_orig, raw_year, raw_date):
-            if cand:
-                m = re.search(r"\b(19\d{2}|20\d{2})\b", cand)
-                if not m:
-                    m = re.search(r"\b(\d{4})\b", cand)
-                if m:
-                    year_4_digits = m.group(1)
-                    break
-
-        # В FLAC тег DATE должен содержать 4 цифры года (YYYY),
-        # чтобы в плеерах и теггерах (Mp3tag, Navidrome) колонка "Year" отображала строго год,
-        # а полную дату (YYYY-MM-DD) сохраняем в ORIGINALDATE.
-        if year_4_digits:
-            audio["date"] = [year_4_digits]
-        elif best_full_date:
+        if best_full_date:
             audio["date"] = [best_full_date]
         elif "date" in audio:
             del audio["date"]
 
-        if len(best_full_date) > 4:
-            audio["originaldate"] = [best_full_date]
-        elif clean_orig and clean_orig != raw_orig:
-            audio["originaldate"] = [clean_orig]
-
-        # Тег YEAR исключён: стандартом FLAC/Vorbis Comment является только DATE
+        # Исключаем устаревшие и избыточные теги (originaldate, year)
+        if "originaldate" in audio:
+            del audio["originaldate"]
         if "year" in audio:
             del audio["year"]
 
