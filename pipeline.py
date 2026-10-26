@@ -24,7 +24,7 @@ from mutagen.flac import FLAC
 
 from covers import CoverCandidate, download_cover, search_covers, is_valid_cover_candidate
 from sanitizer import TagSanitizer
-from surgeon import FLACSurgeon, clean_date_str, parse_genres
+from surgeon import FLACSurgeon, clean_date_str, extract_year_and_date, parse_genres
 from renamer import FileSystemManager
 from lyricist import LyricManager, clean_track_title
 
@@ -279,17 +279,14 @@ def enrich_single_track_release(folder: Path) -> dict | None:
         audio["tracktotal"] = [str(tot)]
         changed = True
 
-    # 4. DATE
+    # 4. DATE & ORIGINALDATE
     rel_date = info.get("release_date", "").strip()
     if rel_date:
-        clean_date = clean_date_str(rel_date)
-        if clean_date:
-            audio["date"] = [clean_date]
+        year_4, full_d = extract_year_and_date(rel_date)
+        if year_4:
+            audio["date"] = [year_4]
+            audio["originaldate"] = [full_d]
             changed = True
-
-    if "originaldate" in audio:
-        del audio["originaldate"]
-        changed = True
 
     if "year" in audio:
         del audio["year"]
@@ -474,12 +471,14 @@ def update_album_cover(folder: Path, cover: CoverCandidate) -> str:
             audio.clear_pictures()
             audio.add_picture(pic)
             if cover.date:
-                clean_cov_date = clean_date_str(cover.date)
-                existing_date = audio.get("date", [""])[0].strip()
-                if not existing_date or _date_is_more_specific(clean_cov_date, existing_date):
-                    audio["date"] = [clean_cov_date]
-            if "originaldate" in audio:
-                del audio["originaldate"]
+                year_4, full_cov_date = extract_year_and_date(cover.date)
+                if year_4:
+                    existing_orig = audio.get("originaldate", [""])[0].strip()
+                    if not existing_orig or _date_is_more_specific(full_cov_date, existing_orig):
+                        audio["originaldate"] = [full_cov_date]
+                        audio["date"] = [year_4]
+                    elif not audio.get("date"):
+                        audio["date"] = [year_4]
             if "year" in audio:
                 del audio["year"]
             audio.save()
@@ -661,26 +660,28 @@ def _date_is_more_specific(new_date: str, existing_date: str) -> bool:
 
 
 def _apply_date_to_flacs(folder: Path, date_str: str) -> None:
-    """Записывает полную дату в DATE всех FLAC в папке."""
-    clean_date = clean_date_str(date_str)
-    if not clean_date:
+    """Записывает год в DATE и полную дату в ORIGINALDATE всех FLAC в папке."""
+    year_4, full_d = extract_year_and_date(date_str)
+    if not year_4:
         return
 
     for f in folder.rglob("*.flac"):
         try:
             audio = FLAC(str(f))
+            existing_orig = audio.get("originaldate", [""])[0].strip()
             existing_date = audio.get("date", [""])[0].strip()
 
             changed = False
             if "year" in audio:
                 del audio["year"]
                 changed = True
-            if "originaldate" in audio:
-                del audio["originaldate"]
-                changed = True
 
-            if not existing_date or _date_is_more_specific(clean_date, existing_date):
-                audio["date"] = [clean_date]
+            if not existing_orig or _date_is_more_specific(full_d, existing_orig):
+                audio["originaldate"] = [full_d]
+                audio["date"] = [year_4]
+                changed = True
+            elif not existing_date:
+                audio["date"] = [year_4]
                 changed = True
 
             if changed:
@@ -910,7 +911,7 @@ def fetch_album_online_metadata(artist: str, album: str) -> OnlineAlbumInfo:
         return OnlineAlbumInfo()
 
     def norm(s: str) -> str:
-        return re.sub(r"[^\w]", "", s.lower())
+        return re.sub(r"[^\w]", "", s.lower().replace("ё", "е"))
 
     # 1. Deezer API
     queries = [f"{artist} {album}", album]
@@ -956,6 +957,9 @@ def fetch_album_online_metadata(artist: str, album: str) -> OnlineAlbumInfo:
                             m[norm(t_short)] = is_exp
                             pos_m[norm(t_title)] = pos
                             pos_m[norm(t_short)] = pos
+                            base_t = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", t_title).strip()
+                            if base_t:
+                                pos_m[norm(base_t)] = pos
 
                         if m or label or rel_date or genres_list:
                             return OnlineAlbumInfo(
@@ -1006,6 +1010,9 @@ def fetch_album_online_metadata(artist: str, album: str) -> OnlineAlbumInfo:
                             m[norm(t_title)] = is_exp
                             if pos:
                                 pos_m[norm(t_title)] = pos
+                                base_t = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", t_title).strip()
+                                if base_t:
+                                    pos_m[norm(base_t)] = pos
 
                 if m or clean_lbl or rel_date or genres_list:
                     return OnlineAlbumInfo(
@@ -1126,7 +1133,7 @@ def enrich_album_online_metadata(folder: Path, force: bool = False) -> tuple[int
     info = fetch_album_online_metadata(artist, album)
 
     def norm(s: str) -> str:
-        return re.sub(r"[^\w]", "", s.lower())
+        return re.sub(r"[^\w]", "", s.lower().replace("ё", "е"))
 
     def track_num_from_filename(filename: str) -> int | None:
         m = re.match(r"^(\d{1,3})[\s\.\-_]", filename)
@@ -1180,51 +1187,79 @@ def enrich_album_online_metadata(folder: Path, force: bool = False) -> tuple[int
                     audio["genre"] = cur_parsed
                     changed = True
 
-            # 4. Простановка даты релиза (DATE: YYYY-MM-DD или YYYY)
+            # 4. Простановка даты релиза (DATE: YYYY, ORIGINALDATE: YYYY-MM-DD или YYYY)
             if info.release_date:
-                existing_date = audio.get("date", [""])[0].strip()
-                if not existing_date or force or _date_is_more_specific(info.release_date, existing_date):
-                    audio["date"] = [info.release_date]
-                    changed = True
-                    date_applied = info.release_date
+                year_4, full_d = extract_year_and_date(info.release_date)
+                if year_4:
+                    existing_orig = audio.get("originaldate", [""])[0].strip()
+                    existing_date = audio.get("date", [""])[0].strip()
+                    if not existing_orig or force or _date_is_more_specific(full_d, existing_orig):
+                        audio["originaldate"] = [full_d]
+                        audio["date"] = [year_4]
+                        changed = True
+                        date_applied = full_d
+                    elif not existing_date:
+                        audio["date"] = [year_4]
+                        changed = True
 
-            # Удаляем originaldate и year
-            if "originaldate" in audio:
-                del audio["originaldate"]
-                changed = True
             if "year" in audio:
                 del audio["year"]
                 changed = True
 
             # 5. Простановка TRACKTOTAL
-            if total_tracks_val > 0:
+            if info.total_tracks:
                 existing_tot = audio.get("tracktotal", ["0"])[0].strip()
-                if not existing_tot or existing_tot == "0" or force:
+                if "/" in existing_tot:
+                    existing_tot = existing_tot.split("/")[-1].strip()
+                if force or not existing_tot or existing_tot == "0" or existing_tot != str(info.total_tracks):
+                    audio["tracktotal"] = [str(info.total_tracks)]
+                    changed = True
+            elif total_tracks_val > 0:
+                existing_tot = audio.get("tracktotal", ["0"])[0].strip()
+                if "/" in existing_tot:
+                    existing_tot = existing_tot.split("/")[-1].strip()
+                if force or not existing_tot or existing_tot == "0":
                     audio["tracktotal"] = [str(total_tracks_val)]
                     changed = True
 
-            # 6. Простановка TRACKNUMBER (если отсутствует или равен 0)
-            existing_num = audio.get("tracknumber", ["0"])[0].strip()
-            if not existing_num or existing_num == "0":
-                title = audio.get("title", [f.stem])[0]
-                clean_t = re.sub(r"(?i)\s*[\(\[][^()\[\]]*(?:feat|ft)[^()\[\]]*[\)\]]", "", title).strip()
-                base_t = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", title).strip()
+            # 6. Простановка TRACKNUMBER (онлайн-канон имеет абсолютный приоритет)
+            pos = None
+            title_cand = audio.get("title", [""])[0].strip() or f.stem
+            # Очищаем ведущий номер трека, если название взято из имени файла ("01. Title")
+            title_clean = re.sub(r"^\d{1,3}[\s\.\-_]+", "", title_cand).strip()
+            clean_t = re.sub(r"(?i)\s*[\(\[][^()\[\]]*(?:feat|ft)[^()\[\]]*[\)\]]", "", title_clean).strip()
+            base_t = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", title_clean).strip()
+
+            if info.track_positions:
                 pos = (
-                    info.track_positions.get(norm(title))
+                    info.track_positions.get(norm(title_clean))
+                    or info.track_positions.get(norm(title_cand))
                     or info.track_positions.get(norm(clean_t))
                     or info.track_positions.get(norm(base_t))
                 )
                 if not pos and norm(base_t):
                     norm_b = norm(base_t)
+                    best_ratio = 0.0
+                    best_cand_pos = None
                     for cand_norm, cand_pos in info.track_positions.items():
-                        if SequenceMatcher(None, norm_b, cand_norm).ratio() >= 0.85:
-                            pos = cand_pos
-                            break
-                if not pos:
-                    pos = track_num_from_filename(f.name)
-                if not pos:
-                    pos = idx
-                audio["tracknumber"] = [str(pos)]
+                        ratio = SequenceMatcher(None, norm_b, cand_norm).ratio()
+                        if ratio >= 0.85 and ratio > best_ratio:
+                            best_ratio = ratio
+                            best_cand_pos = cand_pos
+                    if best_cand_pos:
+                        pos = best_cand_pos
+
+            existing_num = audio.get("tracknumber", ["0"])[0].strip()
+            if "/" in existing_num:
+                existing_num = existing_num.split("/")[0].strip()
+
+            if pos:
+                if force or not existing_num or existing_num == "0" or existing_num != str(pos):
+                    audio["tracknumber"] = [str(pos)]
+                    changed = True
+            elif not existing_num or existing_num == "0":
+                fn_num = track_num_from_filename(f.name)
+                audio["tracknumber"] = [str(fn_num if fn_num is not None else idx)]
                 changed = True
 
             if changed:
@@ -1240,13 +1275,6 @@ def enrich_album_online_metadata(folder: Path, force: bool = False) -> tuple[int
         log.info("Проставлен тег GENRE (%s) для треков в %s", genre_applied, folder.name)
     if date_applied:
         log.info("Проставлен тег DATE ('%s') для треков в %s", date_applied, folder.name)
-
-    return marked_count, label_applied
-
-    if marked_count > 0:
-        log.info("Проставлен тег ITUNESADVISORY (Explicit) для %d треков в %s", marked_count, folder.name)
-    if label_applied:
-        log.info("Проставлен тег LABEL ('%s') для треков в %s", label_applied, folder.name)
 
     return marked_count, label_applied
 
