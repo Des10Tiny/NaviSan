@@ -724,6 +724,11 @@ class LyricManager:
                 if existing_has_sync and not res.is_synced:
                     return "Сохранено караоке 🎤 (в сети только обычный)"
 
+                # Если уже был обычный текст и в сети снова только обычный текст (нет караоке)
+                # при выключенном overwrite — не перезаписываем файл и не считаем его добавленным
+                if lrc_path.exists() and not overwrite and not res.is_synced:
+                    return "Уже есть 📁"
+
                 lrc_path.write_text(res.text, encoding="utf-8")
                 try:
                     lrc_path.chmod(0o664)
@@ -739,14 +744,20 @@ class LyricManager:
                 }
                 source_label = source_labels.get(res.source, res.source.upper())
 
-                prefix = "Обновлено караоке" if existing_has_sync else ("Синхронизированный" if res.is_synced else "Обычный текст")
+                if lrc_path.exists() and res.is_synced and not existing_has_sync:
+                    prefix = "Обновлено до караоке"
+                elif existing_has_sync:
+                    prefix = "Обновлено караоке"
+                else:
+                    prefix = "Синхронизированный" if res.is_synced else "Обычный текст"
+
                 icon = "🎤" if res.is_synced else "📄"
                 return f"{prefix} [{source_label}] {icon}"
 
             if existing_has_sync:
                 return "Сохранено караоке 🎤"
             elif lrc_path.exists():
-                return "Обычный текст 📄"
+                return "Уже есть 📁"
 
             return "Не найдено ❌"
         except Exception as e:

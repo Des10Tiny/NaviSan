@@ -17,6 +17,7 @@ import shutil
 from collections import Counter
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 
 import httpx
@@ -567,6 +568,16 @@ def apply_pipeline(
             pass
         report.append(f"• `{Path(new_path).name}`{track_artist_str} — {lrc_status}")
 
+    # Очистка осиротевших .lrc файлов (для которых нет соответствующего .flac)
+    current_flac_stems = {f.stem for f in folder.rglob("*.flac")}
+    for lrc_f in folder.rglob("*.lrc"):
+        if lrc_f.stem not in current_flac_stems:
+            try:
+                lrc_f.unlink()
+                log.info("Удалён осиротевший .lrc файл: %s", lrc_f.name)
+            except Exception as e:
+                log.warning("Не удалось удалить осиротевший .lrc %s: %s", lrc_f.name, e)
+
     # Переименовываем папку альбома последней (пути выше уже отработали).
     new_folder = Path(renamer.rename_album_folder(str(folder)))
     report.append(f"📁 `{new_folder.name}`")
@@ -930,6 +941,131 @@ class OnlineAlbumInfo:
     total_tracks: int = 0
 
 
+@lru_cache(maxsize=128)
+def _fetch_genius_album_tracks_cached(artist: str, album: str) -> tuple[tuple[tuple[str, int], ...], int, str]:
+    """Запрашивает треклист альбома из Genius API с кэшированием."""
+    if not artist or not album:
+        return (), 0, ""
+
+    def norm(s: str) -> str:
+        return re.sub(r"[^\w]", "", s.lower().replace("ё", "е"))
+
+    g_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    queries = [f"{artist} {album}", album]
+    first_artist = artist.split(",")[0].split("&")[0].strip()
+    if first_artist and first_artist != artist:
+        queries.insert(1, f"{first_artist} {album}")
+
+    candidates = []
+    seen_ids = set()
+    norm_alb = norm(album)
+
+    try:
+        with httpx.Client(headers=g_headers, timeout=6.0) as client:
+            for q in queries:
+                try:
+                    r = client.get("https://genius.com/api/search/multi", params={"q": q})
+                    if r.status_code != 200:
+                        continue
+                    sections = r.json().get("response", {}).get("sections", [])
+                    for s in sections:
+                        for h in s.get("hits", []):
+                            if h.get("type") == "album" or s.get("type") == "album":
+                                res = h.get("result", {})
+                                alb_id = res.get("id")
+                                if not alb_id or alb_id in seen_ids:
+                                    continue
+                                seen_ids.add(alb_id)
+                                alb_name = res.get("name", "")
+                                art_name = res.get("primary_artist_names", "") or res.get("artist", {}).get("name", "")
+
+                                # Фильтруем служебные страницы и переводы Genius
+                                lower_alb = alb_name.lower()
+                                lower_art = art_name.lower()
+                                if any(bad in lower_alb for bad in ["romanized", "translation", "traducción", "tracklist", "credits", "booklet", "liner notes"]):
+                                    continue
+                                if any(bad in lower_art for bad in ["genius romanizations", "genius translations"]):
+                                    continue
+
+                                c_norm_alb = norm(alb_name)
+                                if norm_alb not in c_norm_alb and c_norm_alb not in norm_alb:
+                                    if SequenceMatcher(None, norm_alb, c_norm_alb).ratio() < 0.65:
+                                        continue
+
+                                candidates.append((alb_id, alb_name, art_name, res))
+                except Exception as e:
+                    log.debug("Ошибка поиска альбома в Genius по запросу '%s': %s", q, e)
+
+                if candidates:
+                    break
+
+            best_pos_items: list[tuple[str, int]] = []
+            best_total = 0
+            best_date = ""
+
+            for alb_id, alb_name, art_name, res in candidates[:3]:
+                try:
+                    tr_r = client.get(f"https://genius.com/api/albums/{alb_id}/tracks")
+                    if tr_r.status_code != 200:
+                        continue
+                    g_tracks = tr_r.json().get("response", {}).get("tracks", [])
+                    if not g_tracks:
+                        continue
+
+                    pos_m: dict[str, int] = {}
+                    for tr in g_tracks:
+                        num = tr.get("number")
+                        s_obj = tr.get("song", {})
+                        t_title = s_obj.get("title", "")
+                        t_feat = s_obj.get("title_with_featured", "")
+                        if num:
+                            if t_title:
+                                pos_m[norm(t_title)] = num
+                                base_t = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", t_title).strip()
+                                if base_t:
+                                    pos_m[norm(base_t)] = num
+                                cl_t = re.sub(r"\s*\([A-Za-z0-9\s\.\-—\'\,\!]+\)$", "", t_title).strip()
+                                if cl_t:
+                                    pos_m[norm(cl_t)] = num
+                            if t_feat:
+                                pos_m[norm(t_feat)] = num
+
+                    rel_date = ""
+                    rdc = res.get("release_date_components") or {}
+                    if rdc.get("year"):
+                        y = rdc["year"]
+                        m = rdc.get("month")
+                        d = rdc.get("day")
+                        if m and d:
+                            rel_date = f"{y:04d}-{m:02d}-{d:02d}"
+                        elif m:
+                            rel_date = f"{y:04d}-{m:02d}"
+                        else:
+                            rel_date = f"{y:04d}"
+
+                    if len(g_tracks) > best_total:
+                        best_pos_items = list(pos_m.items())
+                        best_total = len(g_tracks)
+                        best_date = rel_date
+                except Exception as e:
+                    log.debug("Ошибка получения треков из Genius для альбома %s: %s", alb_id, e)
+
+            return tuple(best_pos_items), best_total, best_date
+    except Exception as e:
+        log.debug("Genius API error for '%s — %s': %s", artist, album, e)
+        return (), 0, ""
+
+
+def fetch_genius_album_tracks(artist: str, album: str) -> tuple[dict[str, int], int, str]:
+    """Запрашивает треклист альбома из Genius API.
+    Возвращает (track_positions, total_tracks, release_date).
+    """
+    items, total, dt = _fetch_genius_album_tracks_cached(artist, album)
+    return dict(items), total, dt
+
+
 def fetch_album_online_metadata(artist: str, album: str) -> OnlineAlbumInfo:
     """Ищет альбом в Deezer (с fallback на iTunes) и возвращает метаданные релиза."""
     if not artist or not album:
@@ -1052,95 +1188,19 @@ def fetch_album_online_metadata(artist: str, album: str) -> OnlineAlbumInfo:
         log.debug("Ошибка запроса метаданных из iTunes для '%s — %s': %s", artist, album, e)
 
     # 3. Genius API fallback (для релизов, не найденных в Deezer/iTunes)
-    try:
-        g_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        }
-        g_queries = [f"{artist} {album}", album]
-        for q in g_queries:
-            r = httpx.get(
-                "https://genius.com/api/search/multi",
-                params={"q": q},
-                headers=g_headers,
-                timeout=6.0,
-            )
-            if r.status_code == 200:
-                sections = r.json().get("response", {}).get("sections", [])
-                for s in sections:
-                    for h in s.get("hits", []):
-                        if h.get("type") == "album" or s.get("type") == "album":
-                            res = h.get("result", {})
-                            alb_id = res.get("id")
-                            if not alb_id:
-                                continue
-
-                            alb_name = res.get("name", "")
-                            art_name = res.get("primary_artist_names", "") or res.get("artist", {}).get("name", "")
-                            norm_alb = norm(album)
-                            norm_cand = norm(alb_name)
-
-                            # Проверяем схожесть названия альбома
-                            if norm_alb not in norm_cand and norm_cand not in norm_alb:
-                                if SequenceMatcher(None, norm_alb, norm_cand).ratio() < 0.65:
-                                    continue
-
-                            # Запрашиваем треклист альбома из Genius
-                            tr_r = httpx.get(
-                                f"https://genius.com/api/albums/{alb_id}/tracks",
-                                headers=g_headers,
-                                timeout=6.0,
-                            )
-                            if tr_r.status_code == 200:
-                                g_tracks = tr_r.json().get("response", {}).get("tracks", [])
-                                if not g_tracks:
-                                    continue
-
-                                pos_m = {}
-                                for tr in g_tracks:
-                                    num = tr.get("number")
-                                    s_obj = tr.get("song", {})
-                                    t_title = s_obj.get("title", "")
-                                    t_feat = s_obj.get("title_with_featured", "")
-
-                                    if num:
-                                        if t_title:
-                                            pos_m[norm(t_title)] = num
-                                            base_t = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", t_title).strip()
-                                            if base_t:
-                                                pos_m[norm(base_t)] = num
-                                            cl_t = re.sub(r"\s*\([A-Za-z0-9\s\.\-—\'\,\!]+\)$", "", t_title).strip()
-                                            if cl_t:
-                                                pos_m[norm(cl_t)] = num
-                                        if t_feat:
-                                            pos_m[norm(t_feat)] = num
-
-                                rel_date = ""
-                                rdc = res.get("release_date_components") or {}
-                                if rdc.get("year"):
-                                    y = rdc["year"]
-                                    m = rdc.get("month")
-                                    d = rdc.get("day")
-                                    if m and d:
-                                        rel_date = f"{y:04d}-{m:02d}-{d:02d}"
-                                    elif m:
-                                        rel_date = f"{y:04d}-{m:02d}"
-                                    else:
-                                        rel_date = f"{y:04d}"
-
-                                log.info(
-                                    "Genius fallback: найден альбом '%s — %s' (id=%s, треков: %d)",
-                                    art_name or artist,
-                                    alb_name,
-                                    alb_id,
-                                    len(g_tracks),
-                                )
-                                return OnlineAlbumInfo(
-                                    track_positions=pos_m,
-                                    release_date=rel_date,
-                                    total_tracks=len(g_tracks),
-                                )
-    except Exception as e:
-        log.debug("Ошибка запроса метаданных из Genius для '%s — %s': %s", artist, album, e)
+    g_pos, g_tot, g_date = fetch_genius_album_tracks(artist, album)
+    if g_pos:
+        log.info(
+            "Genius fallback: найден альбом '%s — %s' (треков: %d)",
+            artist,
+            album,
+            g_tot,
+        )
+        return OnlineAlbumInfo(
+            track_positions=g_pos,
+            release_date=g_date,
+            total_tracks=g_tot,
+        )
 
     return OnlineAlbumInfo()
 
@@ -1157,6 +1217,30 @@ def enrich_album_online_metadata(folder: Path, force: bool = False) -> tuple[int
 
     info = fetch_album_online_metadata(artist, album)
 
+    # Genius-фоллбэк для треклиста:
+    # 1) если у Deezer/iTunes нет track_positions
+    # 2) если на стримингах меньше треков, чем файлов в папке (усечённый стриминг-релиз)
+    if not info.track_positions or info.total_tracks < len(flac_files):
+        g_pos, g_total, g_date = fetch_genius_album_tracks(artist, album)
+        if g_pos:
+            if not info.track_positions or (g_total >= len(flac_files) > info.total_tracks):
+                log.info(
+                    "Genius треклист выбран как более полный (%d треков против %d в стриминге): '%s — %s'",
+                    g_total,
+                    info.total_tracks,
+                    artist,
+                    album,
+                )
+                info.track_positions = g_pos
+                info.total_tracks = max(info.total_tracks, g_total)
+            else:
+                for k, v in g_pos.items():
+                    if k not in info.track_positions:
+                        info.track_positions[k] = v
+                info.total_tracks = max(info.total_tracks, g_total)
+            if not info.release_date and g_date:
+                info.release_date = g_date
+
     def norm(s: str) -> str:
         return re.sub(r"[^\w]", "", s.lower().replace("ё", "е"))
 
@@ -1170,13 +1254,141 @@ def enrich_album_online_metadata(folder: Path, force: bool = False) -> tuple[int
     label_applied = ""
     genre_applied: list[str] = []
     date_applied = ""
-    total_tracks_val = info.total_tracks or len(flac_files)
 
+    # ── Подготовка глобального бесколлизионного распределения номеров треков ──
+    files_data = []
     for idx, f in enumerate(flac_files, 1):
         try:
             audio = FLAC(str(f))
-            changed = False
+            t_cand = audio.get("title", [""])[0].strip() or f.stem
+            t_clean = re.sub(r"^\d{1,3}[\s\.\-_]+", "", t_cand).strip()
+            raw_tn = audio.get("tracknumber", ["0"])[0].strip().split("/")[0].strip()
+            ex_num = int(raw_tn) if raw_tn.isdigit() and int(raw_tn) > 0 else None
+            fn_n = track_num_from_filename(f.name)
+            files_data.append({
+                "file": f,
+                "audio": audio,
+                "idx": idx,
+                "title_cand": t_cand,
+                "title_clean": t_clean,
+                "existing_num": ex_num,
+                "fn_num": fn_n,
+            })
+        except Exception as e:
+            log.warning("Ошибка чтения %s: %s", f.name, e)
 
+    matched_pos: dict[Path, tuple[int, float]] = {}
+    pos_to_file: dict[int, tuple[Path, float]] = {}
+
+    if info.track_positions:
+        for fd in files_data:
+            f = fd["file"]
+            t_clean = fd["title_clean"]
+            t_cand = fd["title_cand"]
+            clean_t = re.sub(r"(?i)\s*[\(\[][^()\[\]]*(?:feat|ft)[^()\[\]]*[\)\]]", "", t_clean).strip()
+            base_t = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", t_clean).strip()
+
+            best_p = None
+            best_sc = 0.0
+
+            for cand_t in (t_clean, t_cand, clean_t, base_t):
+                c_norm = norm(cand_t)
+                if c_norm in info.track_positions:
+                    best_p = info.track_positions[c_norm]
+                    best_sc = 1.0
+                    break
+
+            if not best_p and norm(base_t):
+                norm_b = norm(base_t)
+                for cand_norm, cand_pos in info.track_positions.items():
+                    r = SequenceMatcher(None, norm_b, cand_norm).ratio()
+                    if r >= 0.85 and r > best_sc:
+                        best_sc = r
+                        best_p = cand_pos
+
+            if best_p:
+                if best_p in pos_to_file:
+                    prev_f, prev_sc = pos_to_file[best_p]
+                    if best_sc > prev_sc:
+                        del matched_pos[prev_f]
+                        matched_pos[f] = (best_p, best_sc)
+                        pos_to_file[best_p] = (f, best_sc)
+                else:
+                    matched_pos[f] = (best_p, best_sc)
+                    pos_to_file[best_p] = (f, best_sc)
+
+    # Если после первого сопоставления остались файлы без номера, проверяем Genius
+    if len(matched_pos) < len(files_data):
+        g_pos, g_total, g_date = fetch_genius_album_tracks(artist, album)
+        if g_pos:
+            for fd in files_data:
+                f = fd["file"]
+                if f in matched_pos:
+                    continue
+                t_clean = fd["title_clean"]
+                t_cand = fd["title_cand"]
+                clean_t = re.sub(r"(?i)\s*[\(\[][^()\[\]]*(?:feat|ft)[^()\[\]]*[\)\]]", "", t_clean).strip()
+                base_t = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", t_clean).strip()
+
+                best_p = None
+                best_sc = 0.0
+
+                for cand_t in (t_clean, t_cand, clean_t, base_t):
+                    c_norm = norm(cand_t)
+                    if c_norm in g_pos:
+                        best_p = g_pos[c_norm]
+                        best_sc = 1.0
+                        break
+
+                if not best_p and norm(base_t):
+                    norm_b = norm(base_t)
+                    for cand_norm, cand_pos in g_pos.items():
+                        r = SequenceMatcher(None, norm_b, cand_norm).ratio()
+                        if r >= 0.85 and r > best_sc:
+                            best_sc = r
+                            best_p = cand_pos
+
+                if best_p and best_p not in pos_to_file:
+                    matched_pos[f] = (best_p, best_sc)
+                    pos_to_file[best_p] = (f, best_sc)
+
+            if g_total > info.total_tracks:
+                info.total_tracks = g_total
+
+    claimed_set = set(pos_to_file.keys())
+    final_track_numbers: dict[Path, int] = {}
+
+    for f, (p, _) in matched_pos.items():
+        final_track_numbers[f] = p
+
+    # Шаг 2: Для файлов без онлайн-совпадений используем existing_num или fn_num, если нет коллизий
+    unmatched = [fd for fd in files_data if fd["file"] not in final_track_numbers]
+    still_unmatched = []
+    for fd in unmatched:
+        cand_num = fd["existing_num"] or fd["fn_num"]
+        if cand_num and cand_num > 0 and cand_num not in claimed_set:
+            final_track_numbers[fd["file"]] = cand_num
+            claimed_set.add(cand_num)
+        else:
+            still_unmatched.append(fd)
+
+    # Шаг 3: Всем оставшимся трекам назначаем наименьшие свободные слоты 1, 2, 3...
+    next_slot = 1
+    for fd in still_unmatched:
+        while next_slot in claimed_set:
+            next_slot += 1
+        final_track_numbers[fd["file"]] = next_slot
+        claimed_set.add(next_slot)
+
+    max_assigned = max(final_track_numbers.values()) if final_track_numbers else 0
+    calculated_total_tracks = max(info.total_tracks or 0, max_assigned, len(flac_files))
+
+    for fd in files_data:
+        f = fd["file"]
+        audio = fd["audio"]
+        changed = False
+
+        try:
             # 1. Простановка лейбла
             if info.label:
                 existing_label = audio.get("label", [""])[0].strip()
@@ -1187,7 +1399,7 @@ def enrich_album_online_metadata(folder: Path, force: bool = False) -> tuple[int
 
             # 2. Простановка ITUNESADVISORY (Explicit)
             if force or "itunesadvisory" not in audio:
-                title = audio.get("title", [f.stem])[0]
+                title = fd["title_cand"]
                 clean_t = re.sub(r"(?i)\s*[\(\[][^()\[\]]*(?:feat|ft)[^()\[\]]*[\)\]]", "", title).strip()
 
                 is_exp = info.explicit_map.get(norm(title)) or info.explicit_map.get(norm(clean_t))
@@ -1232,59 +1444,27 @@ def enrich_album_online_metadata(folder: Path, force: bool = False) -> tuple[int
                 changed = True
 
             # 5. Простановка TRACKTOTAL
-            if info.total_tracks:
-                existing_tot = audio.get("tracktotal", ["0"])[0].strip()
-                if "/" in existing_tot:
-                    existing_tot = existing_tot.split("/")[-1].strip()
-                if force or not existing_tot or existing_tot == "0" or existing_tot != str(info.total_tracks):
-                    audio["tracktotal"] = [str(info.total_tracks)]
-                    changed = True
-            elif total_tracks_val > 0:
-                existing_tot = audio.get("tracktotal", ["0"])[0].strip()
-                if "/" in existing_tot:
-                    existing_tot = existing_tot.split("/")[-1].strip()
-                if force or not existing_tot or existing_tot == "0":
-                    audio["tracktotal"] = [str(total_tracks_val)]
+            existing_tot = audio.get("tracktotal", ["0"])[0].strip().split("/")[0].strip()
+            if not existing_tot or existing_tot == "0" or force or existing_tot != str(calculated_total_tracks):
+                audio["tracktotal"] = [str(calculated_total_tracks)]
+                changed = True
+
+            # 6. Простановка TRACKNUMBER (строго уникальный без дубликатов)
+            target_num = final_track_numbers.get(f)
+            if target_num is not None:
+                existing_num = audio.get("tracknumber", ["0"])[0].strip().split("/")[0].strip()
+                if not existing_num or existing_num == "0" or existing_num != str(target_num) or force:
+                    audio["tracknumber"] = [str(target_num)]
                     changed = True
 
-            # 6. Простановка TRACKNUMBER (онлайн-канон имеет абсолютный приоритет)
-            pos = None
-            title_cand = audio.get("title", [""])[0].strip() or f.stem
-            # Очищаем ведущий номер трека, если название взято из имени файла ("01. Title")
-            title_clean = re.sub(r"^\d{1,3}[\s\.\-_]+", "", title_cand).strip()
-            clean_t = re.sub(r"(?i)\s*[\(\[][^()\[\]]*(?:feat|ft)[^()\[\]]*[\)\]]", "", title_clean).strip()
-            base_t = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", title_clean).strip()
-
-            if info.track_positions:
-                pos = (
-                    info.track_positions.get(norm(title_clean))
-                    or info.track_positions.get(norm(title_cand))
-                    or info.track_positions.get(norm(clean_t))
-                    or info.track_positions.get(norm(base_t))
-                )
-                if not pos and norm(base_t):
-                    norm_b = norm(base_t)
-                    best_ratio = 0.0
-                    best_cand_pos = None
-                    for cand_norm, cand_pos in info.track_positions.items():
-                        ratio = SequenceMatcher(None, norm_b, cand_norm).ratio()
-                        if ratio >= 0.85 and ratio > best_ratio:
-                            best_ratio = ratio
-                            best_cand_pos = cand_pos
-                    if best_cand_pos:
-                        pos = best_cand_pos
-
-            existing_num = audio.get("tracknumber", ["0"])[0].strip()
-            if "/" in existing_num:
-                existing_num = existing_num.split("/")[0].strip()
-
-            if pos:
-                if force or not existing_num or existing_num == "0" or existing_num != str(pos):
-                    audio["tracknumber"] = [str(pos)]
-                    changed = True
-            elif not existing_num or existing_num == "0":
-                fn_num = track_num_from_filename(f.name)
-                audio["tracknumber"] = [str(fn_num if fn_num is not None else idx)]
+            # 7. Простановка DISCNUMBER и DISCTOTAL
+            existing_disc = audio.get("discnumber", ["0"])[0].strip().split("/")[0].strip()
+            if not existing_disc or existing_disc == "0":
+                audio["discnumber"] = ["1"]
+                changed = True
+            existing_disctot = audio.get("disctotal", ["0"])[0].strip().split("/")[0].strip()
+            if not existing_disctot or existing_disctot == "0":
+                audio["disctotal"] = ["1"]
                 changed = True
 
             if changed:
@@ -1444,6 +1624,16 @@ def upgrade_album(
                     lyrics_added += 1
         except Exception as e:
             log.warning("Ошибка обработки трека %s: %s", flac.name, e)
+
+    # Очистка осиротевших .lrc файлов (для которых нет соответствующего .flac)
+    current_flac_stems = {f.stem for f in album_dir.rglob("*.flac")}
+    for lrc_f in album_dir.rglob("*.lrc"):
+        if lrc_f.stem not in current_flac_stems:
+            try:
+                lrc_f.unlink()
+                log.info("Удалён осиротевший .lrc файл: %s", lrc_f.name)
+            except Exception as e:
+                log.warning("Не удалось удалить осиротевший .lrc %s: %s", lrc_f.name, e)
 
     # Шаг 4: Приведение имени папки к каноническому 'Artist - Album'
     if cancel_flag and cancel_flag():

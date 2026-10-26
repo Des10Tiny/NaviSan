@@ -240,6 +240,18 @@ class FLACSurgeon:
         if raw_dt and raw_dt.isdigit() and int(raw_dt) > 0:
             audio["disctotal"] = [str(int(raw_dt))]
 
+        # Fallback: номер трека из имени файла (если отсутствует в тегах)
+        if not audio.get("tracknumber") or audio.get("tracknumber") in (["0"], ["00"]):
+            m_fn = re.match(r"^(\d{1,3})[\s\.\-_]", path.name)
+            if m_fn:
+                audio["tracknumber"] = [str(int(m_fn.group(1)))]
+
+        # Гарантируем корректный номер диска
+        if not audio.get("discnumber") or audio.get("discnumber") in (["0"], ["00"]):
+            audio["discnumber"] = ["1"]
+        if not audio.get("disctotal") or audio.get("disctotal") in (["0"], ["00"]):
+            audio["disctotal"] = ["1"]
+
         # 1. Фильтрация по whitelist тегов и очистка мусорных значений
         saved_tags: dict[str, list[str]] = {}
         for key in list(audio.keys()):
