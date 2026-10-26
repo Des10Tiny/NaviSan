@@ -365,7 +365,35 @@ def album_info(folder: Path) -> tuple[str, str]:
         except Exception:
             pass
 
-    album_name = Counter(album_names).most_common(1)[0][0] if album_names else ""
+    folder_album_hint = ""
+    folder_artist_hint = ""
+    if " - " in folder.name:
+        parts = folder.name.split(" - ", 1)
+        folder_artist_hint = parts[0].strip()
+        folder_album_hint = parts[1].strip()
+
+    album_name = ""
+    if album_names:
+        counts = Counter(album_names)
+        most_common = counts.most_common()
+        top_name, top_count = most_common[0]
+        # Если есть явный лидер (> половины треков), берём его
+        if top_count > len(album_names) / 2:
+            album_name = top_name
+        else:
+            # Ничья или разброд тегов: проверяем, совпадает ли какой-то из кандидатов с именем папки
+            if folder_album_hint:
+                norm_hint = re.sub(r"[^\w]", "", folder_album_hint.lower())
+                for cand, _ in most_common:
+                    if re.sub(r"[^\w]", "", cand.lower()) == norm_hint:
+                        album_name = cand
+                        break
+            if not album_name:
+                album_name = top_name
+    elif folder_album_hint:
+        album_name = folder_album_hint
+    else:
+        album_name = folder.name
 
     if album_artists_list:
         best_aa = list(Counter(album_artists_list).most_common(1)[0][0])
@@ -384,18 +412,12 @@ def album_info(folder: Path) -> tuple[str, str]:
             else:
                 artist_str = ", ".join(ordered_common)
         else:
-            artist_str = ", ".join(first_track_artists) if first_track_artists else "Various Artists"
+            if folder_artist_hint:
+                artist_str = folder_artist_hint
+            else:
+                artist_str = ", ".join(first_track_artists) if first_track_artists else "Various Artists"
     else:
-        artist_str = folder.name
-
-    if not album_name:
-        if " - " in folder.name:
-            parts = folder.name.split(" - ", 1)
-            if not artist_str or artist_str == folder.name:
-                artist_str = parts[0].strip()
-            album_name = parts[1].strip()
-        else:
-            album_name = folder.name
+        artist_str = folder_artist_hint or folder.name
 
     return artist_str, album_name
 
