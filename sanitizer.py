@@ -38,7 +38,7 @@ class TagSanitizer:
             db_path = os.environ.get("NAVISAN_DB", "navidrome.db")
         self.db_path = str(db_path)
         self.split_pattern = re.compile(
-            r"(?i)\s+(?:feat\.?|ft\.?|x|and|и)\s+|\s*[,;&]\s*"
+            r"(?i)\s+(?:feat\.?|ft\.?|x|and|и|&)\s+|\s*[,;]\s*"
         )
 
     def _get_artist_from_db(self, artist_name: str) -> str | None:

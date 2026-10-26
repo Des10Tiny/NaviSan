@@ -794,15 +794,16 @@ def get_album_artist_suggestions(folder: Path) -> list[str]:
 
 
 def add_track_artist(track_path: Path, new_artist: str) -> list[str]:
-    """Добавляет одного или нескольких артистов в тег ARTIST трека."""
-    new_artist = new_artist.strip()
-    if not new_artist or not track_path.exists():
+    """Добавляет артиста в тег ARTIST трека (ручной ввод не разбивается)."""
+    raw = new_artist.strip()
+    if not raw or not track_path.exists():
         return []
 
-    sanitizer = TagSanitizer()
-    to_add = sanitizer.process_artists(new_artist)
-    if not to_add:
-        to_add = [new_artist]
+    # Если пользователь явно разделил точкой с запятой ';', добавляем каждого
+    if ";" in raw:
+        to_add = [a.strip() for a in raw.split(";") if a.strip()]
+    else:
+        to_add = [raw]
 
     audio = FLAC(str(track_path))
     artists = list(audio.get("artist", []))
@@ -835,11 +836,10 @@ def update_album_artist(folder: Path, new_album_artist: str) -> tuple[Path, str]
     raw = new_album_artist.strip()
     if raw in ("-", "none", "del", "delete", "clear", ""):
         aa_list: list[str] = []
+    elif ";" in raw:
+        aa_list = [a.strip() for a in raw.split(";") if a.strip()]
     else:
-        sanitizer = TagSanitizer()
-        aa_list = sanitizer.process_artists(raw)
-        if not aa_list and raw:
-            aa_list = [raw]
+        aa_list = [raw]
 
     for f in flac_files:
         try:
@@ -905,7 +905,10 @@ def set_track_artists(track_path: Path, new_artists_str: str) -> list[str]:
     raw = new_artists_str.strip()
     if not raw:
         return []
-    artists_list = [raw]
+    if ";" in raw:
+        artists_list = [a.strip() for a in raw.split(";") if a.strip()]
+    else:
+        artists_list = [raw]
     try:
         audio = FLAC(str(track_path))
         audio["artist"] = artists_list
